@@ -6,12 +6,11 @@ from core.docx_generator import build_docx
 from core.evidence_validator import validate_report
 from core.job_manifest import build_manifest, manifest_summary
 from core.reference_reader import extract_reference_context
-from core.vision_client import optimize_image
 from database.db_manager import get_plant_history_context, get_similar_cases_context
 from engines.master_engine import run_master_analysis
 
-PROMPT_VERSION = "2026-08-28-master-v1"
-REPORT_SCHEMA_VERSION = "2.0"
+PROMPT_VERSION = "2026-08-28-master-v2"
+REPORT_SCHEMA_VERSION = "2.1"
 
 
 def _file_sha256(file) -> str:
@@ -25,7 +24,7 @@ def _file_sha256(file) -> str:
         return "unavailable"
 
 
-def build_job_cache_key(uploaded_files, api_key: str, plant_name: str = "", lang: str = "th") -> str:
+def build_job_cache_key(uploaded_files, api_key: str = "", plant_name: str = "", lang: str = "th", *args, **kwargs) -> str:
     digest = hashlib.sha256(hashlib.sha256((api_key or "").encode()).digest())
     digest.update(PROMPT_VERSION.encode("ascii"))
     digest.update(f"{plant_name}|{lang}".encode("utf-8"))
@@ -49,20 +48,19 @@ def _enforce_engineering_rules(report: dict) -> dict:
     except (ValueError, TypeError):
         p_act, p_rated, i_grid = 0.0, 0.0, 0.0
 
-    findings_text = " ".join(
-        f"{finding.get('observed_data', '')} {finding.get('engineering_diagnosis', '')}"
-        for finding in report.get("evidence_findings", [])
-    ).lower()
+    findings_text = " ".join([
+        f"{f.get('observed_data', '')} {f.get('engineering_diagnosis', '')}"
+        for f in report.get("evidence_findings", []) if isinstance(f, dict)
+    ]).lower()
 
-    if (
-        (p_rated > 0 and (p_act / p_rated) < 0.05 and i_grid == 0)
-        or "grid a/b/c phase current: 0" in findings_text
-        or "grid current: 0" in findings_text
-    ):
+    # Rule 1: Zero Grid Current or severe power drop (<5%) -> Lock to CRITICAL
+    if (p_rated > 0 and (p_act / p_rated) < 0.05 and i_grid == 0) or "grid a/b/c phase current: 0" in findings_text or "grid current: 0" in findings_text or "grid current เป็น 0" in findings_text:
         summary["overall_status"] = "CRITICAL"
-    elif any(keyword in findings_text for keyword in ("ground fault", "short circuit", "insulation fault", "major alarm")):
+    # Rule 2: Active Ground Fault / Short Circuit / Major Alarms -> Lock to CRITICAL
+    elif any(k in findings_text for k in ["ground fault", "short circuit", "insulation fault", "major alarm", "ลัดวงจรลงดิน", "รั่วลงดิน"]):
         summary["overall_status"] = "CRITICAL"
-    elif summary.get("overall_status") == "NORMAL" and "0 alarms" in findings_text:
+    # Rule 3: Confirmed normal operation with 0 alarms
+    elif summary.get("overall_status") == "NORMAL" and ("0 alarm" in findings_text or "ไม่มีความผิดปกติ" in findings_text):
         summary["overall_status"] = "NORMAL"
 
     report["plant_summary"] = summary
@@ -75,7 +73,7 @@ def process_field_report(uploaded_files, api_key: str, plant_name: str = "", lan
     for index, item in enumerate(manifest):
         item["sha256"] = _file_sha256(uploaded_files[index])
     detected_plant = _plant_name(manifest)
-    context_plant = requested_plant or detected_plant
+    context_plant = requested_plant if len(requested_plant) > 2 else detected_plant
     report_type = "MIXED_REPORT" if len({item["evidence_type"] for item in manifest}) > 1 else "MASTER_REPORT"
     site_context = get_plant_history_context(context_plant, report_type)
     reference_context, references = extract_reference_context(uploaded_files)
@@ -94,7 +92,10 @@ def process_field_report(uploaded_files, api_key: str, plant_name: str = "", lan
         "evidence_count": len(manifest),
         "evidence_summary": manifest_summary(manifest),
     }
-    selected_plant = requested_plant or report["plant_summary"].get("plant_name") or detected_plant or "Unknown Site"
+    if len(requested_plant) > 2:
+        selected_plant = requested_plant
+    else:
+        selected_plant = report.get("plant_summary", {}).get("plant_name") or detected_plant or "Unknown Site"
     report["plant_summary"]["plant_name"] = selected_plant
     report["language"] = lang if lang in {"th", "en"} else "th"
     document = build_docx(report, uploaded_files)

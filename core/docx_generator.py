@@ -10,12 +10,29 @@ from docx.oxml.ns import nsdecls
 from docx.shared import Inches, Pt, RGBColor
 
 SEVERITY_STYLE = {
-    "CRITICAL": ("FFD1D1", "C00000"), "วิกฤต": ("FFD1D1", "C00000"),
-    "WARNING": ("FFE699", "D66011"), "เตือน": ("FFE699", "D66011"),
-    "NORMAL": ("D9EAD3", "38761D"), "ปกติ": ("D9EAD3", "38761D"),
+    "CRITICAL": ("FFD2D2", "900000"), "วิกฤต": ("FFD2D2", "900000"),
+    "WARNING": ("FFF0B3", "593800"),  "เตือน": ("FFF0B3", "593800"),
+    "NORMAL": ("D4EDDA", "155724"),   "ปกติ": ("D4EDDA", "155724"),
     "INFORMATIONAL": ("DDEBF7", "1F4E79"), "ข้อมูลทั่วไป": ("DDEBF7", "1F4E79"),
-    "EXTREME": ("F4CCCC", "990000"), "HIGH": ("FCE5CD", "A61C00"),
-    "MEDIUM": ("FFF2CC", "7F6000"), "LOW": ("D9EAD3", "274E13"),
+}
+
+TABLE_HEADERS = {
+    "th": {
+        "summary": ["โรงไฟฟ้า / ไซต์งาน", "ขนาดพิกัด (kWp)", "วันที่ตรวจสอบ", "สถานะระบบ", "กำลังผลิตจริง (kW)", "กระแสส่งเข้ากริด (A)"],
+        "findings": ["หมวดการตรวจสอบ", "ไฟล์หลักฐาน", "ข้อมูลที่ตรวจพบ", "ผลการวินิจฉัยทางวิศวกรรม", "ระดับความรุนแรง"],
+        "damage": ["จุดบกพร่องที่พบ", "อุปกรณ์ที่จะเสียหายตามมา", "กลไกความเสียหายต่อเนื่อง (หากปล่อยทิ้งไว้)", "ค่าเสียหายหากไม่ซ่อม", "ค่าใช้จ่ายป้องกันตอนนี้"],
+        "roots": ["ประเด็นปัญหา", "คำอธิบายเชิงลึก", "หลักฐานสนับสนุน"],
+        "actions": ["ขั้นตอน", "หัวข้อการแก้ไข", "รายละเอียดการปฏิบัติงาน"],
+        "spares": ["รายการอุปกรณ์ / เครื่องมือ", "จำนวนที่แนะนำ", "วัตถุประสงค์การใช้งาน"],
+    },
+    "en": {
+        "summary": ["Plant / Site", "Capacity (kWp)", "Audit Date", "Overall Status", "Active Power (kW)", "Grid Current (A)"],
+        "findings": ["Category", "Source File", "Observed Data", "Engineering Diagnosis", "Severity"],
+        "damage": ["Identified Fault", "Component at Risk", "Damage Escalation Mechanism", "Cost if Neglected", "Immediate Prevention Cost"],
+        "roots": ["Issue", "Detailed Description", "Supporting Evidence"],
+        "actions": ["Step", "Title", "Actions"],
+        "spares": ["Item / Tool Name", "Recommended Qty", "Purpose"],
+    }
 }
 
 
@@ -72,21 +89,20 @@ def _table(doc, headers, rows, severity_column=None):
     return table
 
 
-def _add_header(doc, language="en"):
+def _add_header(doc):
     logo_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logo.png")
     for section in doc.sections:
         table = section.header.add_table(rows=1, cols=2, width=Inches(7.2))
         left, right = table.rows[0].cells
         try:
             if os.path.exists(logo_path):
-                left.paragraphs[0].add_run().add_picture(logo_path, height=Inches(0.3))
+                left.paragraphs[0].add_run().add_picture(logo_path, height=Inches(0.35))
             else:
                 raise OSError("logo unavailable")
         except Exception:
             left.text = "STUDIO OM"
         right.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.RIGHT
-        header_text = "รายงานวิศวกรรม Solar O&M" if language == "th" else "Solar O&M Engineering Report"
-        run = right.paragraphs[0].add_run(header_text)
+        run = right.paragraphs[0].add_run("Solar O&M Engineering Report")
         run.bold = True
         run.font.name = "Arial"
 
@@ -115,7 +131,7 @@ def _add_photos(doc, uploaded_files):
 
 def build_docx(report: dict, uploaded_files=None) -> io.BytesIO:
     doc = Document()
-    _add_header(doc, report.get("language", "th"))
+    _add_header(doc)
     for section in doc.sections:
         section.top_margin = Inches(0.65)
         section.bottom_margin = Inches(0.6)
@@ -123,76 +139,85 @@ def build_docx(report: dict, uploaded_files=None) -> io.BytesIO:
         section.right_margin = Inches(0.65)
 
     language = report.get("language", "th")
+    lang_key = "th" if language == "th" else "en"
+    headers_map = TABLE_HEADERS.get(lang_key, TABLE_HEADERS["th"])
+
     labels = {
-        "th": {
-            "title": "รายงานวิศวกรรม Solar O&M", "executive": "สรุปผู้บริหาร", "findings": "ผลการตรวจสอบจากหลักฐาน",
-            "causes": "สาเหตุราก", "damage": "ตารางความเสียหายต่อเนื่องและความเสี่ยง",
-            "actions": "การแก้ไข", "spares": "อะไหล่และเครื่องมือ", "photos": "ภาคผนวก A หลักฐานภาพ",
-            "summary_headers": ["โรงไฟฟ้า", "กำลังติดตั้ง", "วันที่ตรวจ", "สถานะ", "กำลังผลิตจริง", "กระแสไฟฟ้าเข้าระบบ"],
-            "finding_headers": ["หมวดหมู่", "แหล่งข้อมูล", "ข้อมูลที่สังเกตได้", "การวินิจฉัยทางวิศวกรรม", "ระดับความรุนแรง"],
-            "damage_headers": ["รหัส", "อุปกรณ์ที่ได้รับผลกระทบ", "รูปแบบความขัดข้อง", "ผลกระทบ", "โอกาสเกิด", "ความรุนแรง", "คะแนน", "ระดับความเสี่ยง", "ผลกระทบทางการเงิน", "ผลกระทบด้านหยุดเดินเครื่อง", "ผลกระทบด้านความปลอดภัย", "มาตรการลดความเสี่ยง", "หลักฐานอ้างอิง"],
-            "cause_headers": ["ประเด็น", "รายละเอียด", "หลักฐานสนับสนุน"], "spare_headers": ["รายการ", "จำนวนแนะนำ", "วัตถุประสงค์"],
-        },
-        "en": {
-            "title": "Solar O&M Engineering Report", "executive": "Executive Summary", "findings": "Evidence Findings",
-            "causes": "Root Causes", "damage": "Consequential Damage & Risk Matrix",
-            "actions": "Corrective Actions", "spares": "Spare Parts and Tools", "photos": "Appendix A Evidence Photos",
-            "summary_headers": ["Plant", "Capacity", "Audit date", "Status", "Active power", "Grid current"],
-            "finding_headers": ["Category", "Source", "Observed data", "Engineering diagnosis", "Severity"],
-            "damage_headers": ["ID", "Affected asset", "Failure mode", "Consequence", "Likelihood", "Severity", "Score", "Risk level", "Financial impact", "Downtime impact", "Safety impact", "Mitigation", "Evidence basis"],
-            "cause_headers": ["Issue", "Description", "Supporting evidence"], "spare_headers": ["Item", "Recommended quantity", "Purpose"],
-        },
-    }.get(language, {})
-    if not labels:
-        labels = {
-            "title": "Solar O&M Engineering Report", "executive": "Executive Summary", "findings": "Evidence Findings",
-            "causes": "Root Causes", "damage": "Consequential Damage & Risk Matrix", "actions": "Corrective Actions",
-            "spares": "Spare Parts and Tools", "photos": "Appendix A Evidence Photos",
-            "summary_headers": ["Plant", "Capacity", "Audit date", "Status", "Active power", "Grid current"],
-            "finding_headers": ["Category", "Source", "Observed data", "Engineering diagnosis", "Severity"],
-            "damage_headers": ["ID", "Affected asset", "Failure mode", "Consequence", "Likelihood", "Severity", "Score", "Risk level", "Financial impact", "Downtime impact", "Safety impact", "Mitigation", "Evidence basis"],
-            "cause_headers": ["Issue", "Description", "Supporting evidence"], "spare_headers": ["Item", "Recommended quantity", "Purpose"],
-        }
+        "th": (
+            "1. สรุปผู้บริหารและสถานะภาพรวม",
+            "2. การประเมินความเสียหายต่อเนื่องและค่าใช้จ่ายหากปล่อยทิ้งไว้ (Consequential Risk Matrix)",
+            "3. ผลการตรวจสอบและวินิจฉัยจากหลักฐานจริง",
+            "4. สาเหตุรากของปัญหา (Root Causes)",
+            "5. แผนปฏิบัติการแก้ไขเชิงวิศวกรรม (Corrective Actions)",
+            "6. รายการเครื่องมือและอะไหล่ที่ต้องจัดเตรียม (Spare Parts & Tooling)",
+            "ภาคผนวก A  หลักฐานภาพถ่ายหน้างาน"
+        ),
+        "en": (
+            "1. Executive Summary & Overview",
+            "2. Consequential Damage & Inaction Risk Matrix",
+            "3. Evidence-Based Technical Findings",
+            "4. Root Cause Analysis",
+            "5. Corrective Action Plan",
+            "6. Spare Parts and Tooling List",
+            "Appendix A  Field Evidence Photos"
+        ),
+    }.get(lang_key, labels["th"] if "labels" in locals() else None)
+
     summary = report.get("plant_summary", {})
-    _heading(doc, f"STUDIO OM | {labels['title'].upper()}", 10)
+    _heading(doc, "STUDIO OM | SOLAR O&M ENGINEERING REPORT", 10)
     _heading(doc, summary.get("plant_name") or "Solar O&M Engineering Report", 16)
-    _table(doc, labels["summary_headers"], [[
+    
+    # 1. Summary Table
+    _table(doc, headers_map["summary"], [[
         summary.get("plant_name"), summary.get("rated_capacity_kw"), summary.get("audit_date"),
         summary.get("overall_status"), summary.get("active_power_kw"), summary.get("grid_current_a"),
     ]], severity_column=3)
-    _heading(doc, labels["executive"])
+
+    # 2. Executive Summary
+    _heading(doc, labels[0], 12)
     doc.add_paragraph(_text(report.get("executive_summary")))
-    _heading(doc, labels["findings"])
-    _table(doc, labels["finding_headers"], [
+
+    # 3. Consequential Damage Matrix (New Feature!)
+    damage_rows = [
+        [item.get("identified_fault"), item.get("component_at_risk"), item.get("escalation_mechanism"), item.get("estimated_damage_cost_thb"), item.get("immediate_prevention_cost_thb")]
+        for item in report.get("inaction_damage_matrix", []) if isinstance(item, dict)
+    ]
+    if damage_rows:
+        _heading(doc, labels[1], 12)
+        _table(doc, headers_map["damage"], damage_rows)
+
+    # 4. Evidence Findings
+    _heading(doc, labels[2], 12)
+    _table(doc, headers_map["findings"], [
         [item.get("category"), item.get("source_file"), item.get("observed_data"), item.get("engineering_diagnosis"), item.get("severity")]
         for item in report.get("evidence_findings", []) if isinstance(item, dict)
     ], severity_column=4)
-    _heading(doc, labels["causes"])
-    _table(doc, labels["cause_headers"], [
+
+    # 5. Root Causes
+    _heading(doc, labels[3], 12)
+    _table(doc, headers_map["roots"], [
         [item.get("issue"), item.get("description"), item.get("supporting_evidence")]
         for item in report.get("root_causes", []) if isinstance(item, dict)
     ])
-    _heading(doc, labels["damage"])
-    _table(doc, labels["damage_headers"], [
-        [item.get("risk_id"), item.get("affected_asset"), item.get("failure_mode"), item.get("consequence"),
-         item.get("likelihood"), item.get("severity"), item.get("risk_score"), item.get("risk_level"),
-         item.get("financial_impact"), item.get("downtime_impact"), item.get("safety_impact"),
-         item.get("mitigation"), item.get("evidence_basis")]
-        for item in report.get("consequential_damage_risk_matrix", []) if isinstance(item, dict)
-    ], severity_column=7)
-    _heading(doc, labels["actions"])
+
+    # 6. Corrective Actions
+    _heading(doc, labels[4], 12)
     for action in report.get("corrective_actions", []):
         if isinstance(action, dict):
             _heading(doc, f"{action.get('step_number', '')}. {action.get('title', '')}", 10)
             for step in action.get("actions", []):
                 doc.add_paragraph(_text(step), style="List Bullet")
-    _heading(doc, labels["spares"])
-    _table(doc, labels["spare_headers"], [
+
+    # 7. Spare Parts
+    _heading(doc, labels[5], 12)
+    _table(doc, headers_map["spares"], [
         [item.get("item_name"), item.get("recommended_qty"), item.get("purpose")]
         for item in report.get("spare_parts_tools", []) if isinstance(item, dict)
     ])
+
+    # 8. Appendix Photos
     if uploaded_files:
-        _heading(doc, labels["photos"])
+        _heading(doc, labels[6], 12)
         _add_photos(doc, uploaded_files)
 
     output = io.BytesIO()

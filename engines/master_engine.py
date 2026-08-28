@@ -1,5 +1,4 @@
 import json
-import io
 from datetime import date
 
 from core.vision_client import execute_gemini_vision, optimize_image
@@ -10,33 +9,72 @@ Analyze only the current uploaded evidence and field notes. Historical/reference
 DO NOT invent numbers or default to template examples. Extract only visible numbers, labels, and text.
 If a value, diagnosis, cause, or action is not visible or proven, use null or "UNCONFIRMED".
 A root cause is proven only by explicit alarm text, measurement evidence, EL evidence, or insulation test evidence.
-Keep observed_data separate from engineering_diagnosis. Cross-correlate independent evidence sources, but mark unsupported conclusions UNCONFIRMED.
+Keep observed_data separate from engineering_diagnosis. Cross-correlate independent evidence sources.
+
+CRITICAL INACTION DAMAGE ANALYSIS:
+For each major or critical issue found, analyze the consequential equipment damage that WILL OCCUR if neglected (e.g. Ground fault -> Inverter MPPT power board fire/short-circuit costing 80,000-150,000 THB vs 500-1,500 THB MC4 repair; Hotspot -> Cell delamination/shattered glass costing 4,500-9,000 THB module replacement vs 0-500 THB cleaning).
+
 If current evidence shows normal operation, 0 alarms, no hotspots, and normal measured currents, set overall_status strictly to NORMAL.
-For a normal operation result, set corrective_actions and spare_parts_tools to one entry stating exactly: "ระบบทำงานสมบูรณ์ตามเกณฑ์มาตรฐาน ไม่พบความผิดปกติที่ต้องซ่อมแซมเร่งด่วน".
-If any LCD, meter screen, or thermal scale is blurry, dark, or cropped, do not guess numbers. State exactly: "ภาพไม่ชัดเจน/ไม่สามารถอ่านค่าเชิงตัวเลขได้ แนะนำให้บันทึกภาพซ้ำหน้างาน".
+For a normal operation result, set corrective_actions, spare_parts_tools, and inaction_damage_matrix to one entry stating: "ระบบทำงานสมบูรณ์ตามเกณฑ์มาตรฐาน ไม่พบความผิดปกติที่ต้องซ่อมแซมเร่งด่วน".
+If any LCD, meter screen, or thermal scale is blurry, dark, or cropped, state: "ภาพไม่ชัดเจน/ไม่สามารถอ่านค่าเชิงตัวเลขได้ แนะนำให้บันทึกภาพซ้ำหน้างาน".
 FIELD_NOTES.txt is optional; analyze visual and meter evidence when notes are absent.
+
 Return JSON only using exactly this schema:
 {
-  "plant_summary": {"plant_name": "string", "rated_capacity_kw": "string", "audit_date": "string",
-    "overall_status": "CRITICAL|WARNING|NORMAL", "active_power_kw": "string", "grid_current_a": "string"},
+  "plant_summary": {
+    "plant_name": "string",
+    "rated_capacity_kw": "string",
+    "audit_date": "string",
+    "overall_status": "CRITICAL|WARNING|NORMAL",
+    "active_power_kw": "string",
+    "grid_current_a": "string"
+  },
   "executive_summary": "string",
-  "evidence_findings": [{"category": "Inverter & Monitoring|Field Alarms|String Electrical|Thermography|Visual Survey",
-    "source_file": "string", "observed_data": "string", "engineering_diagnosis": "string",
-    "severity": "CRITICAL|WARNING|NORMAL|INFORMATIONAL"}],
-  "root_causes": [{"issue": "string", "description": "string", "supporting_evidence": "string"}],
-    "consequential_damage_risk_matrix": [{"risk_id": "string", "affected_asset": "string",
-        "failure_mode": "string", "consequence": "string", "likelihood": "RARE|UNLIKELY|POSSIBLE|LIKELY|ALMOST_CERTAIN",
-        "severity": "INSIGNIFICANT|MINOR|MODERATE|MAJOR|CATASTROPHIC", "risk_score": 1,
-        "risk_level": "LOW|MEDIUM|HIGH|EXTREME", "financial_impact": "string", "downtime_impact": "string",
-        "safety_impact": "string", "mitigation": "string", "evidence_basis": "string"}],
-  "corrective_actions": [{"step_number": 1, "title": "string", "actions": ["string"]}],
-  "spare_parts_tools": [{"item_name": "string", "recommended_qty": "string", "purpose": "string"}]
+  "evidence_findings": [
+    {
+      "category": "Inverter & Monitoring|Field Alarms|String Electrical|Thermography|Visual Survey",
+      "source_file": "string",
+      "observed_data": "string",
+      "engineering_diagnosis": "string",
+      "severity": "CRITICAL|WARNING|NORMAL|INFORMATIONAL"
+    }
+  ],
+  "inaction_damage_matrix": [
+    {
+      "identified_fault": "string",
+      "component_at_risk": "string",
+      "escalation_mechanism": "string",
+      "estimated_damage_cost_thb": "string",
+      "immediate_prevention_cost_thb": "string"
+    }
+  ],
+  "root_causes": [
+    {
+      "issue": "string",
+      "description": "string",
+      "supporting_evidence": "string"
+    }
+  ],
+  "corrective_actions": [
+    {
+      "step_number": 1,
+      "title": "string",
+      "actions": ["string"]
+    }
+  ],
+  "spare_parts_tools": [
+    {
+      "item_name": "string",
+      "recommended_qty": "string",
+      "purpose": "string"
+    }
+  ]
 }
 """
 
 LANGUAGE_INSTRUCTIONS = {
-    "th": "Write all narrative fields in professional engineering Thai. Keep technical terms such as Inverter, String, Active Power, Megger Test, and Hotspot where clearer.",
-    "en": "Write all narrative fields in professional technical English. Keep equipment names and measurement units exactly as observed.",
+    "th": "Write all narrative fields and analysis in professional engineering Thai. Keep standard technical terms (Inverter, String, Active Power, Megger Test, MC4, Hotspot) where appropriate.",
+    "en": "Write all narrative fields and analysis in professional technical English. Keep equipment names and measurement units exactly as observed.",
 }
 
 
@@ -57,14 +95,13 @@ def _file_parts(uploaded_files):
         elif lower.endswith(".pdf"):
             try:
                 from pypdf import PdfReader
+                reader = PdfReader(file)
+                pdf_text = "\n".join([page.extract_text() or "" for page in reader.pages[:10]])
                 file.seek(0)
-                reader = PdfReader(io.BytesIO(file.read()))
-                file.seek(0)
-                text = "\n".join((page.extract_text() or "") for page in reader.pages).strip()
-                parts.append({"text": f"REFERENCE DOCUMENT (not current evidence) {name}:\n{text[:12000]}"})
+                parts.append({"text": f"REFERENCE DOCUMENT CONTENT ({name}):\n{pdf_text[:8000]}"})
             except Exception:
                 file.seek(0)
-                parts.append({"text": f"REFERENCE DOCUMENT (not current evidence; text unavailable): {name}"})
+                parts.append({"text": f"REFERENCE DOCUMENT: {name}"})
     return parts
 
 
