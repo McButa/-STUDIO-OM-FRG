@@ -1,0 +1,6 @@
+streamlit
+python-docx
+pillow
+google-generativeai
+pypdf
+pydantic>=2.0
