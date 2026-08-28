@@ -20,7 +20,7 @@ def _render_login():
             logo_data = base64.b64encode(logo_file.read()).decode("ascii")
     logo_markup = f'<img src="data:image/png;base64,{logo_data}" alt="Studio OM logo">' if logo_data else ""
     st.markdown(
-        f"""
+        """
         <style>
         [data-testid="stHeader"], [data-testid="stToolbar"],
         [data-testid="stDecoration"], footer, [data-testid="stSidebar"] {
@@ -60,6 +60,8 @@ def _render_login():
             margin-bottom: 1.8rem;
         }
         div[data-testid="stForm"] {
+            width: min(440px, 92vw);
+            margin: -12rem auto 0;
             background: transparent;
             border: 0;
             padding: 0;
@@ -77,6 +79,11 @@ def _render_login():
             box-shadow: 0 8px 24px rgba(96, 165, 250, .34);
         }
         </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f"""
         <div class="login-shell"><div class="login-card">
             {logo_markup}
             <div class="login-slogan">Studio OM® — We build TECH for Energy</div>
