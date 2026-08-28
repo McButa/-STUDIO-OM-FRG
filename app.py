@@ -1,5 +1,103 @@
+import base64
 import os
 import streamlit as st
+
+st.set_page_config(
+    page_title="STUDIO OM Field Report Engine (Production)",
+    page_icon="⚡",
+    layout="wide"
+)
+
+
+def _app_password() -> str:
+    return str(st.secrets.get("APP_PASSWORD", os.getenv("APP_PASSWORD", "om2026")))
+
+
+def _render_login():
+    logo_data = ""
+    if os.path.isfile("logo.png"):
+        with open("logo.png", "rb") as logo_file:
+            logo_data = base64.b64encode(logo_file.read()).decode("ascii")
+    logo_markup = f'<img src="data:image/png;base64,{logo_data}" alt="Studio OM logo">' if logo_data else ""
+    st.markdown(
+        f"""
+        <style>
+        [data-testid="stHeader"], [data-testid="stToolbar"],
+        [data-testid="stDecoration"], footer, [data-testid="stSidebar"] {
+            visibility: hidden;
+            display: none;
+        }
+        .stApp {
+            background: radial-gradient(circle at 50% 30%, #1e293b, #0f172a 52%, #020617);
+        }
+        .login-shell {
+            min-height: 82vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .login-card {
+            width: min(440px, 92vw);
+            padding: 2.6rem 2.4rem 2.2rem;
+            text-align: center;
+            background: rgba(15, 23, 42, .68);
+            border: 1px solid rgba(148, 163, 184, .24);
+            border-radius: 24px;
+            box-shadow: 0 24px 80px rgba(0, 0, 0, .42), inset 0 1px rgba(255, 255, 255, .08);
+            backdrop-filter: blur(20px);
+        }
+        .login-card img {
+            width: min(290px, 78vw);
+            max-height: 180px;
+            object-fit: contain;
+            filter: drop-shadow(0 0 20px rgba(125, 211, 252, .32));
+            margin-bottom: 1rem;
+        }
+        .login-slogan {
+            color: #e2e8f0;
+            font-size: 1rem;
+            letter-spacing: .08em;
+            margin-bottom: 1.8rem;
+        }
+        div[data-testid="stForm"] {
+            background: transparent;
+            border: 0;
+            padding: 0;
+        }
+        div[data-testid="stFormSubmitButton"] button {
+            width: 100%;
+            border: 0;
+            color: #082f49;
+            background: linear-gradient(135deg, #bae6fd, #60a5fa);
+            font-weight: 700;
+            transition: transform .2s ease, box-shadow .2s ease;
+        }
+        div[data-testid="stFormSubmitButton"] button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 24px rgba(96, 165, 250, .34);
+        }
+        </style>
+        <div class="login-shell"><div class="login-card">
+            {logo_markup}
+            <div class="login-slogan">Studio OM® — We build TECH for Energy</div>
+        </div></div>
+        """,
+        unsafe_allow_html=True,
+    )
+    with st.form("login_form"):
+        password = st.text_input("รหัสผ่าน", type="password", placeholder="กรอกรหัสผ่านเพื่อเข้าใช้งาน...", label_visibility="collapsed")
+        submitted = st.form_submit_button("🔓 ปลดล็อกเข้าสู่ระบบ / Unlock", use_container_width=True)
+    if submitted:
+        if password == _app_password():
+            st.session_state["authenticated"] = True
+            st.rerun()
+        st.error("รหัสผ่านไม่ถูกต้อง กรุณาลองใหม่อีกครั้ง")
+
+
+if not st.session_state.get("authenticated", False):
+    _render_login()
+    st.stop()
+
 from router import build_job_cache_key, process_field_report
 from database.db_manager import (
     get_all_audits,
@@ -8,14 +106,12 @@ from database.db_manager import (
     save_approved_report_to_db,
 )
 
-st.set_page_config(
-    page_title="STUDIO OM Field Report Engine (Production)",
-    page_icon="⚡",
-    layout="wide"
-)
-
 # Sidebar
 st.sidebar.header("⚙️ การเชื่อมต่อ AI")
+st.sidebar.markdown("👤 ผู้ใช้งาน: **O&M Engineer**")
+if st.sidebar.button("🚪 ออกจากระบบ (Logout)", use_container_width=True):
+    st.session_state["authenticated"] = False
+    st.rerun()
 api_key = st.sidebar.text_input("Google Gemini API Key", type="password", help="วาง Google Gemini API Key")
 language_label = st.sidebar.selectbox("Report Language", ["🇹🇭 ภาษาไทย", "🇬🇧 English"], index=0)
 report_language = "th" if language_label.startswith("🇹🇭") else "en"
