@@ -1,4 +1,5 @@
 import json
+import io
 from datetime import date
 
 from core.vision_client import execute_gemini_vision, optimize_image
@@ -23,6 +24,11 @@ Return JSON only using exactly this schema:
     "source_file": "string", "observed_data": "string", "engineering_diagnosis": "string",
     "severity": "CRITICAL|WARNING|NORMAL|INFORMATIONAL"}],
   "root_causes": [{"issue": "string", "description": "string", "supporting_evidence": "string"}],
+    "consequential_damage_risk_matrix": [{"risk_id": "string", "affected_asset": "string",
+        "failure_mode": "string", "consequence": "string", "likelihood": "RARE|UNLIKELY|POSSIBLE|LIKELY|ALMOST_CERTAIN",
+        "severity": "INSIGNIFICANT|MINOR|MODERATE|MAJOR|CATASTROPHIC", "risk_score": 1,
+        "risk_level": "LOW|MEDIUM|HIGH|EXTREME", "financial_impact": "string", "downtime_impact": "string",
+        "safety_impact": "string", "mitigation": "string", "evidence_basis": "string"}],
   "corrective_actions": [{"step_number": 1, "title": "string", "actions": ["string"]}],
   "spare_parts_tools": [{"item_name": "string", "recommended_qty": "string", "purpose": "string"}]
 }
@@ -49,7 +55,16 @@ def _file_parts(uploaded_files):
             parts.append({"text": f"CURRENT EVIDENCE IMAGE: {name}"})
             parts.append({"inline_data": {"mime_type": "image/png", "data": encoded}})
         elif lower.endswith(".pdf"):
-            parts.append({"text": f"REFERENCE DOCUMENT (not current evidence): {name}"})
+            try:
+                from pypdf import PdfReader
+                file.seek(0)
+                reader = PdfReader(io.BytesIO(file.read()))
+                file.seek(0)
+                text = "\n".join((page.extract_text() or "") for page in reader.pages).strip()
+                parts.append({"text": f"REFERENCE DOCUMENT (not current evidence) {name}:\n{text[:12000]}"})
+            except Exception:
+                file.seek(0)
+                parts.append({"text": f"REFERENCE DOCUMENT (not current evidence; text unavailable): {name}"})
     return parts
 
 

@@ -40,6 +40,35 @@ def _plant_name(manifest):
     return next(iter(sites), "Unknown Site") if len(sites) == 1 else "Unknown Site"
 
 
+def _enforce_engineering_rules(report: dict) -> dict:
+    summary = report.get("plant_summary", {})
+    try:
+        p_act = float(str(summary.get("active_power_kw", "0")).replace("kW", "").strip() or 0)
+        p_rated = float(str(summary.get("rated_capacity_kw", "0")).replace("kW", "").strip() or 0)
+        i_grid = float(str(summary.get("grid_current_a", "0")).replace("A", "").strip() or 0)
+    except (ValueError, TypeError):
+        p_act, p_rated, i_grid = 0.0, 0.0, 0.0
+
+    findings_text = " ".join(
+        f"{finding.get('observed_data', '')} {finding.get('engineering_diagnosis', '')}"
+        for finding in report.get("evidence_findings", [])
+    ).lower()
+
+    if (
+        (p_rated > 0 and (p_act / p_rated) < 0.05 and i_grid == 0)
+        or "grid a/b/c phase current: 0" in findings_text
+        or "grid current: 0" in findings_text
+    ):
+        summary["overall_status"] = "CRITICAL"
+    elif any(keyword in findings_text for keyword in ("ground fault", "short circuit", "insulation fault", "major alarm")):
+        summary["overall_status"] = "CRITICAL"
+    elif summary.get("overall_status") == "NORMAL" and "0 alarms" in findings_text:
+        summary["overall_status"] = "NORMAL"
+
+    report["plant_summary"] = summary
+    return report
+
+
 def process_field_report(uploaded_files, api_key: str, plant_name: str = "", lang: str = "th") -> tuple:
     requested_plant = plant_name.strip()
     manifest = build_manifest(uploaded_files)
@@ -52,6 +81,7 @@ def process_field_report(uploaded_files, api_key: str, plant_name: str = "", lan
     reference_context, references = extract_reference_context(uploaded_files)
     knowledge_context = get_similar_cases_context([context_plant], report_type, context_plant)
     report = run_master_analysis(uploaded_files, api_key, site_context, knowledge_context + reference_context, lang=lang, plant_name=context_plant or None)
+    report = _enforce_engineering_rules(report)
     report = validate_report(report)
     report["input_files"] = [str(getattr(file, "name", "unknown")) for file in uploaded_files]
     report["evidence_manifest"] = manifest

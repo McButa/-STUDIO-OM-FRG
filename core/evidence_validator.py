@@ -36,6 +36,23 @@ class RootCause(BaseModel):
     supporting_evidence: str
 
 
+class ConsequentialDamageRisk(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    risk_id: str
+    affected_asset: str
+    failure_mode: str
+    consequence: str
+    likelihood: str
+    severity: str
+    risk_score: int = Field(ge=1, le=25)
+    risk_level: str
+    financial_impact: str
+    downtime_impact: str
+    safety_impact: str
+    mitigation: str
+    evidence_basis: str
+
+
 class CorrectiveAction(BaseModel):
     model_config = ConfigDict(extra="ignore")
     step_number: int = Field(ge=1)
@@ -56,6 +73,7 @@ class MasterReport(BaseModel):
     executive_summary: str
     evidence_findings: list[EvidenceFinding]
     root_causes: list[RootCause]
+    consequential_damage_risk_matrix: list[ConsequentialDamageRisk] = Field(default_factory=list)
     corrective_actions: list[CorrectiveAction]
     spare_parts_tools: list[SparePartTool]
 
