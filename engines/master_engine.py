@@ -81,7 +81,7 @@ LANGUAGE_INSTRUCTIONS = {
 }
 
 
-def _file_parts(uploaded_files):
+def file_parts(uploaded_files):
     parts = []
     for file in uploaded_files:
         name = str(getattr(file, "name", "unknown"))
@@ -106,6 +106,9 @@ def _file_parts(uploaded_files):
                 file.seek(0)
                 parts.append({"text": f"REFERENCE DOCUMENT: {name}"})
     return parts
+
+
+_file_parts = file_parts  # kept for internal call sites within this module
 
 
 def _parse_json_response(value):

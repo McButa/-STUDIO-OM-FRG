@@ -199,6 +199,9 @@ def build_docx(report: dict, uploaded_files=None) -> io.BytesIO:
     # 2. Executive Summary
     _heading(doc, labels[0], 12)
     doc.add_paragraph(_text(report.get("executive_summary")))
+    if report.get("verification_note"):
+        note = doc.add_paragraph()
+        note.add_run(f"หมายเหตุ Verification Pass: {report['verification_note']}").italic = True
 
     # 3. Consequential Damage Matrix (New Feature!)
     damage_rows = [

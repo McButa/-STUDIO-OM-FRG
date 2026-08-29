@@ -8,8 +8,9 @@ from core.job_manifest import build_manifest, manifest_summary
 from core.reference_reader import extract_reference_context
 from database.db_manager import get_plant_history_context, get_similar_cases_context
 from engines.master_engine import run_master_analysis
+from engines.verification_engine import run_critical_verification
 
-PROMPT_VERSION = "2026-08-28-master-v2"
+PROMPT_VERSION = "2026-08-29-master-v3-verification"
 REPORT_SCHEMA_VERSION = "2.1"
 
 
@@ -39,7 +40,7 @@ def _plant_name(manifest):
     return next(iter(sites), "Unknown Site") if len(sites) == 1 else "Unknown Site"
 
 
-def _enforce_engineering_rules(report: dict) -> dict:
+def _enforce_engineering_rules(report: dict) -> tuple:
     summary = report.get("plant_summary", {})
     try:
         p_act = float(str(summary.get("active_power_kw", "0")).replace("kW", "").strip() or 0)
@@ -53,18 +54,21 @@ def _enforce_engineering_rules(report: dict) -> dict:
         for f in report.get("evidence_findings", []) if isinstance(f, dict)
     ]).lower()
 
+    hard_locked = False
     # Rule 1: Zero Grid Current or severe power drop (<5%) -> Lock to CRITICAL
     if (p_rated > 0 and (p_act / p_rated) < 0.05 and i_grid == 0) or "grid a/b/c phase current: 0" in findings_text or "grid current: 0" in findings_text or "grid current เป็น 0" in findings_text:
         summary["overall_status"] = "CRITICAL"
+        hard_locked = True
     # Rule 2: Active Ground Fault / Short Circuit / Major Alarms -> Lock to CRITICAL
     elif any(k in findings_text for k in ["ground fault", "short circuit", "insulation fault", "major alarm", "ลัดวงจรลงดิน", "รั่วลงดิน"]):
         summary["overall_status"] = "CRITICAL"
+        hard_locked = True
     # Rule 3: Confirmed normal operation with 0 alarms
     elif summary.get("overall_status") == "NORMAL" and ("0 alarm" in findings_text or "ไม่มีความผิดปกติ" in findings_text):
         summary["overall_status"] = "NORMAL"
 
     report["plant_summary"] = summary
-    return report
+    return report, hard_locked
 
 
 def process_field_report(uploaded_files, api_key: str, plant_name: str = "", lang: str = "th") -> tuple:
@@ -79,8 +83,10 @@ def process_field_report(uploaded_files, api_key: str, plant_name: str = "", lan
     reference_context, references = extract_reference_context(uploaded_files)
     knowledge_context = get_similar_cases_context([context_plant], report_type, context_plant)
     report = run_master_analysis(uploaded_files, api_key, site_context, knowledge_context + reference_context, lang=lang, plant_name=context_plant or None)
-    report = _enforce_engineering_rules(report)
+    report, status_hard_locked = _enforce_engineering_rules(report)
     report = validate_report(report)
+    if report.get("plant_summary", {}).get("overall_status") == "CRITICAL" and not status_hard_locked:
+        report = run_critical_verification(uploaded_files, report, api_key)
     report["input_files"] = [str(getattr(file, "name", "unknown")) for file in uploaded_files]
     report["evidence_manifest"] = manifest
     report["reference_documents"] = references
