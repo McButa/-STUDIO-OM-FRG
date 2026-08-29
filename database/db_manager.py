@@ -434,7 +434,24 @@ def save_approved_report_to_db(data: dict, report_type: str = "", engineer_solut
     conn.close()
     return report_id
 
-def get_total_damage_exposure(plant_name: str = "") -> float:
+def get_previous_audit_kpis(plant_name: str) -> Optional[dict]:
+    """เอาผลตรวจครั้งล่าสุดของไซต์นี้ (ก่อนหน้ารอบปัจจุบัน) มาไว้ให้โค้ดคำนวณ delta เอง — ไม่ให้ LLM เดา
+    ตัวเลขเปรียบเทียบ เพราะตอน process_field_report เรียกฟังก์ชันนี้ งานปัจจุบันยังไม่ถูกบันทึกลง audits
+    (บันทึกก็ต่อเมื่อวิศวกรกดอนุมัติ) แถวล่าสุดที่เจอจึงเป็นรอบก่อนหน้าเสมอ"""
+    plant_name = (plant_name or "").strip()
+    if not plant_name:
+        return None
+    conn = get_connection()
+    cursor = conn.cursor()
+    row = cursor.execute("""
+    SELECT audit_date, status, active_power_kw, grid_current_a
+    FROM audits WHERE plant_name = ? ORDER BY id DESC LIMIT 1
+    """, (plant_name,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+
     """SUM ความเสี่ยงทางการเงินสูงสุด (max_damage_cost_thb) รวมทั้งหมด หรือกรองเฉพาะไซต์เดียว สำหรับ dashboard"""
     conn = get_connection()
     cursor = conn.cursor()

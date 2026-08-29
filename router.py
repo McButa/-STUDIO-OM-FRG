@@ -3,10 +3,10 @@ import uuid
 from datetime import datetime, timezone
 
 from core.docx_generator import build_docx
-from core.evidence_validator import validate_report
+from core.evidence_validator import coerce_float, validate_report
 from core.job_manifest import build_manifest, manifest_summary
 from core.reference_reader import extract_reference_context
-from database.db_manager import get_plant_history_context, get_similar_cases_context
+from database.db_manager import get_plant_history_context, get_previous_audit_kpis, get_similar_cases_context
 from engines.master_engine import run_master_analysis
 from engines.verification_engine import run_critical_verification
 
@@ -42,12 +42,9 @@ def _plant_name(manifest):
 
 def _enforce_engineering_rules(report: dict) -> tuple:
     summary = report.get("plant_summary", {})
-    try:
-        p_act = float(str(summary.get("active_power_kw", "0")).replace("kW", "").strip() or 0)
-        p_rated = float(str(summary.get("rated_capacity_kw", "0")).replace("kW", "").strip() or 0)
-        i_grid = float(str(summary.get("grid_current_a", "0")).replace("A", "").strip() or 0)
-    except (ValueError, TypeError):
-        p_act, p_rated, i_grid = 0.0, 0.0, 0.0
+    p_act = coerce_float(summary.get("active_power_kw")) or 0.0
+    p_rated = coerce_float(summary.get("rated_capacity_kw")) or 0.0
+    i_grid = coerce_float(summary.get("grid_current_a")) or 0.0
 
     findings_text = " ".join([
         f"{f.get('observed_data', '')} {f.get('engineering_diagnosis', '')}"
@@ -71,6 +68,34 @@ def _enforce_engineering_rules(report: dict) -> tuple:
     return report, hard_locked
 
 
+def _compute_trend(report: dict, plant_name: str) -> dict | None:
+    """เทียบตัวเลข KPI รอบนี้กับรอบก่อนหน้าด้วยโค้ดล้วนๆ ไม่ให้ LLM เดาแนวโน้มเอง"""
+    previous = get_previous_audit_kpis(plant_name)
+    if not previous:
+        return None
+    summary = report.get("plant_summary", {})
+    curr_power = summary.get("active_power_kw_num")
+    prev_power = coerce_float(previous.get("active_power_kw"))
+    curr_current = summary.get("grid_current_a_num")
+    prev_current = coerce_float(previous.get("grid_current_a"))
+
+    def _pct_delta(curr, prev):
+        if curr is None or prev is None or prev == 0:
+            return None
+        return round((curr - prev) / prev * 100, 1)
+
+    power_delta = _pct_delta(curr_power, prev_power)
+    current_delta = _pct_delta(curr_current, prev_current)
+    if power_delta is None and current_delta is None:
+        return None
+    return {
+        "previous_audit_date": previous.get("audit_date"),
+        "previous_status": previous.get("status"),
+        "active_power_delta_pct": power_delta,
+        "grid_current_delta_pct": current_delta,
+    }
+
+
 def process_field_report(uploaded_files, api_key: str, plant_name: str = "", lang: str = "th") -> tuple:
     requested_plant = plant_name.strip()
     manifest = build_manifest(uploaded_files)
@@ -87,6 +112,9 @@ def process_field_report(uploaded_files, api_key: str, plant_name: str = "", lan
     report = validate_report(report)
     if report.get("plant_summary", {}).get("overall_status") == "CRITICAL" and not status_hard_locked:
         report = run_critical_verification(uploaded_files, report, api_key)
+    trend = _compute_trend(report, context_plant)
+    if trend:
+        report["trend_analysis"] = trend
     report["input_files"] = [str(getattr(file, "name", "unknown")) for file in uploaded_files]
     report["evidence_manifest"] = manifest
     report["reference_documents"] = references

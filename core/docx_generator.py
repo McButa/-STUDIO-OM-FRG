@@ -203,6 +203,22 @@ def build_docx(report: dict, uploaded_files=None) -> io.BytesIO:
         note = doc.add_paragraph()
         note.add_run(f"หมายเหตุ Verification Pass: {report['verification_note']}").italic = True
 
+    trend = report.get("trend_analysis")
+    if trend:
+        def _delta_phrase(label, d):
+            if d == 0:
+                return f"{label}ไม่เปลี่ยนแปลง"
+            return f"{label}{'เพิ่มขึ้น' if d > 0 else 'ลดลง'} {abs(d)}%"
+        parts = []
+        if trend.get("active_power_delta_pct") is not None:
+            parts.append(_delta_phrase("กำลังผลิต", trend["active_power_delta_pct"]))
+        if trend.get("grid_current_delta_pct") is not None:
+            parts.append(_delta_phrase("กระแสไฟฟ้า", trend["grid_current_delta_pct"]))
+        if parts:
+            trend_p = doc.add_paragraph()
+            prev_date = trend.get("previous_audit_date") or "-"
+            trend_p.add_run(f"แนวโน้มเทียบรอบตรวจก่อนหน้า ({prev_date}): {', '.join(parts)}").bold = True
+
     # 3. Consequential Damage Matrix (New Feature!)
     damage_rows = [
         [

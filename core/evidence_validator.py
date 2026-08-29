@@ -11,6 +11,26 @@ Category = Literal[
 ]
 
 
+def coerce_float(value) -> float | None:
+    """Strip unit text/commas from LLM output and cast to float. Missing/unparseable -> None
+    (unlike _coerce_cost, None here is meaningful: 'not measured' must stay distinguishable from 0)."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    cleaned = re.sub(r"[^\d.\-]", "", str(value))
+    try:
+        return float(cleaned) if cleaned not in ("", "-", ".") else None
+    except ValueError:
+        return None
+
+
+def _coerce_cost(value) -> float:
+    """Strip currency text/commas from LLM output and cast to float. Missing/unparseable -> 0.0."""
+    parsed = coerce_float(value)
+    return parsed if parsed is not None else 0.0
+
+
 class PlantSummary(BaseModel):
     model_config = ConfigDict(extra="ignore")
     plant_name: str | None = None
@@ -19,6 +39,17 @@ class PlantSummary(BaseModel):
     overall_status: Status | None = None
     active_power_kw: str | None = None
     grid_current_a: str | None = None
+    # Numeric versions parsed once here so no other file needs its own regex to read these values.
+    rated_capacity_kw_num: float | None = None
+    active_power_kw_num: float | None = None
+    grid_current_a_num: float | None = None
+
+    @model_validator(mode="after")
+    def _parse_numeric_kpis(self):
+        self.rated_capacity_kw_num = coerce_float(self.rated_capacity_kw)
+        self.active_power_kw_num = coerce_float(self.active_power_kw)
+        self.grid_current_a_num = coerce_float(self.grid_current_a)
+        return self
 
 
 class EvidenceFinding(BaseModel):
@@ -35,19 +66,6 @@ class RootCause(BaseModel):
     issue: str
     description: str
     supporting_evidence: str
-
-
-def _coerce_cost(value) -> float:
-    """Strip currency text/commas from LLM output and cast to float. Missing/unparseable -> 0.0."""
-    if value is None:
-        return 0.0
-    if isinstance(value, (int, float)):
-        return float(value)
-    cleaned = re.sub(r"[^\d.\-]", "", str(value))
-    try:
-        return float(cleaned) if cleaned else 0.0
-    except ValueError:
-        return 0.0
 
 
 class InactionDamageItem(BaseModel):
