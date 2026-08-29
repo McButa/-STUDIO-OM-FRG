@@ -1,6 +1,7 @@
+import re
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 
 Status = Literal["CRITICAL", "WARNING", "NORMAL"]
@@ -36,21 +37,49 @@ class RootCause(BaseModel):
     supporting_evidence: str
 
 
-class ConsequentialDamageRisk(BaseModel):
+def _coerce_cost(value) -> float:
+    """Strip currency text/commas from LLM output and cast to float. Missing/unparseable -> 0.0."""
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    cleaned = re.sub(r"[^\d.\-]", "", str(value))
+    try:
+        return float(cleaned) if cleaned else 0.0
+    except ValueError:
+        return 0.0
+
+
+class InactionDamageItem(BaseModel):
     model_config = ConfigDict(extra="ignore")
-    risk_id: str
-    affected_asset: str
-    failure_mode: str
-    consequence: str
-    likelihood: str
-    severity: str
-    risk_score: int = Field(ge=1, le=25)
-    risk_level: str
-    financial_impact: str
-    downtime_impact: str
-    safety_impact: str
-    mitigation: str
-    evidence_basis: str
+    identified_fault: str
+    component_at_risk: str
+    escalation_mechanism: str
+    min_damage_cost_thb: float = 0.0
+    max_damage_cost_thb: float = 0.0
+    min_prevention_cost_thb: float = 0.0
+    max_prevention_cost_thb: float = 0.0
+
+    @field_validator(
+        "min_damage_cost_thb", "max_damage_cost_thb",
+        "min_prevention_cost_thb", "max_prevention_cost_thb",
+        mode="before",
+    )
+    @classmethod
+    def _parse_cost(cls, value):
+        return _coerce_cost(value)
+
+    @model_validator(mode="after")
+    def _swap_if_inverted(self):
+        if self.max_damage_cost_thb < self.min_damage_cost_thb:
+            self.min_damage_cost_thb, self.max_damage_cost_thb = (
+                self.max_damage_cost_thb, self.min_damage_cost_thb,
+            )
+        if self.max_prevention_cost_thb < self.min_prevention_cost_thb:
+            self.min_prevention_cost_thb, self.max_prevention_cost_thb = (
+                self.max_prevention_cost_thb, self.min_prevention_cost_thb,
+            )
+        return self
 
 
 class CorrectiveAction(BaseModel):
@@ -73,7 +102,7 @@ class MasterReport(BaseModel):
     executive_summary: str
     evidence_findings: list[EvidenceFinding]
     root_causes: list[RootCause]
-    consequential_damage_risk_matrix: list[ConsequentialDamageRisk] = Field(default_factory=list)
+    inaction_damage_matrix: list[InactionDamageItem] = Field(default_factory=list)
     corrective_actions: list[CorrectiveAction]
     spare_parts_tools: list[SparePartTool]
 
@@ -86,6 +115,9 @@ def validate_report(data: dict) -> dict:
         raise ValueError(f"Master report schema validation failed: {error}") from error
 
     result = report.model_dump()
+    result["total_max_damage_exposure_thb"] = sum(
+        item["max_damage_cost_thb"] for item in result["inaction_damage_matrix"]
+    )
     evidence_text = " ".join(
         f"{finding.source_file} {finding.observed_data} {finding.engineering_diagnosis}"
         for finding in report.evidence_findings

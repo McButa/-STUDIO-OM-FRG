@@ -13,6 +13,7 @@ Keep observed_data separate from engineering_diagnosis. Cross-correlate independ
 
 CRITICAL INACTION DAMAGE ANALYSIS:
 For each major or critical issue found, analyze the consequential equipment damage that WILL OCCUR if neglected (e.g. Ground fault -> Inverter MPPT power board fire/short-circuit costing 80,000-150,000 THB vs 500-1,500 THB MC4 repair; Hotspot -> Cell delamination/shattered glass costing 4,500-9,000 THB module replacement vs 0-500 THB cleaning).
+Output damage and prevention costs as RAW NUMBERS ONLY (no commas, no currency symbols, no text) in min_damage_cost_thb, max_damage_cost_thb, min_prevention_cost_thb, max_prevention_cost_thb.
 
 If current evidence shows normal operation, 0 alarms, no hotspots, and normal measured currents, set overall_status strictly to NORMAL.
 For a normal operation result, set corrective_actions, spare_parts_tools, and inaction_damage_matrix to one entry stating: "ระบบทำงานสมบูรณ์ตามเกณฑ์มาตรฐาน ไม่พบความผิดปกติที่ต้องซ่อมแซมเร่งด่วน".
@@ -44,8 +45,10 @@ Return JSON only using exactly this schema:
       "identified_fault": "string",
       "component_at_risk": "string",
       "escalation_mechanism": "string",
-      "estimated_damage_cost_thb": "string",
-      "immediate_prevention_cost_thb": "string"
+      "min_damage_cost_thb": 0,
+      "max_damage_cost_thb": 0,
+      "min_prevention_cost_thb": 0,
+      "max_prevention_cost_thb": 0
     }
   ],
   "root_causes": [

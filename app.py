@@ -208,10 +208,14 @@ with tab_report:
 
         st.info(f"**สรุปสถานการณ์เชิงวิศวกรรม:** {data.get('executive_summary', '-')}")
 
-        for finding in data.get("evidence_findings", []):
+        st.markdown("**บันทึกวิธีแก้ไขจริงและอะไหล่ที่ใช้ (ไว้เป็นความรู้ให้เคสหน้า):**")
+        for i, finding in enumerate(data.get("evidence_findings", [])):
             with st.expander(f"{finding.get('severity', '')} | {finding.get('category', '')} | {finding.get('source_file', '')}"):
                 st.write(finding.get("observed_data", ""))
                 st.caption(finding.get("engineering_diagnosis", ""))
+                if finding.get("severity") in ("CRITICAL", "WARNING"):
+                    st.text_input("วิธีแก้ที่ทำจริง", key=f"solution_{i}", placeholder="เช่น เปลี่ยน MC4 connector ที่ชำรุด")
+                    st.text_input("อะไหล่ที่ใช้จริง", key=f"parts_{i}", placeholder="เช่น MC4 x2")
 
         plant_slug = str(p_info.get("plant_name", "Site")).replace(" ", "_")
         col_dl, col_save = st.columns(2)
@@ -232,7 +236,15 @@ with tab_report:
                 with open(docx_path, "wb") as output_file:
                     output_file.write(st.session_state["active_docx"])
                 data.setdefault("analysis_metadata", {})["docx_path"] = docx_path
-                rep_id = save_approved_report_to_db(data)
+                engineer_solutions = [
+                    {"solution": st.session_state.get(f"solution_{i}", ""), "parts": st.session_state.get(f"parts_{i}", "")}
+                    for i in range(len(data.get("evidence_findings", [])))
+                ]
+                rep_id = save_approved_report_to_db(
+                    data,
+                    report_type=st.session_state.get("active_type", ""),
+                    engineer_solutions=engineer_solutions,
+                )
                 st.success(f"🎉 บันทึกรายงาน ID #{rep_id} และเคสความรู้เข้า Database สำเร็จเรียบร้อย!")
 
 # ==============================================================

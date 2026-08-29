@@ -40,6 +40,28 @@ def _text(value):
     return "" if value is None else str(value)
 
 
+def _cost_range(min_value, max_value) -> str:
+    try:
+        lo, hi = float(min_value or 0), float(max_value or 0)
+    except (TypeError, ValueError):
+        return "-"
+    if lo == 0 and hi == 0:
+        return "-"
+    return f"{lo:,.0f} - {hi:,.0f} บาท" if lo != hi else f"{hi:,.0f} บาท"
+
+
+def _photo_reference_map(uploaded_files) -> dict:
+    """Assigns Appendix A-N numbers to photo files in the order they'll be rendered."""
+    mapping = {}
+    index = 1
+    for file in uploaded_files or []:
+        name = _text(getattr(file, "name", ""))
+        if name.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+            mapping[name] = f"A-{index}"
+            index += 1
+    return mapping
+
+
 def _heading(doc, text, size=11):
     paragraph = doc.add_paragraph()
     run = paragraph.add_run(_text(text))
@@ -107,14 +129,15 @@ def _add_header(doc):
         run.font.name = "Arial"
 
 
-def _add_photos(doc, uploaded_files):
+def _add_photos(doc, uploaded_files, photo_refs: dict):
     for file in uploaded_files or []:
         name = _text(getattr(file, "name", "evidence"))
         if not name.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
             continue
         paragraph = doc.add_paragraph()
         paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        caption = paragraph.add_run(name)
+        ref = photo_refs.get(name, "")
+        caption = paragraph.add_run(f"[{ref}] {name}" if ref else name)
         caption.bold = True
         try:
             file.seek(0)
@@ -179,17 +202,31 @@ def build_docx(report: dict, uploaded_files=None) -> io.BytesIO:
 
     # 3. Consequential Damage Matrix (New Feature!)
     damage_rows = [
-        [item.get("identified_fault"), item.get("component_at_risk"), item.get("escalation_mechanism"), item.get("estimated_damage_cost_thb"), item.get("immediate_prevention_cost_thb")]
+        [
+            item.get("identified_fault"), item.get("component_at_risk"), item.get("escalation_mechanism"),
+            _cost_range(item.get("min_damage_cost_thb"), item.get("max_damage_cost_thb")),
+            _cost_range(item.get("min_prevention_cost_thb"), item.get("max_prevention_cost_thb")),
+        ]
         for item in report.get("inaction_damage_matrix", []) if isinstance(item, dict)
     ]
     if damage_rows:
         _heading(doc, labels[1], 12)
         _table(doc, headers_map["damage"], damage_rows)
+        total_exposure = report.get("total_max_damage_exposure_thb")
+        if total_exposure:
+            note = doc.add_paragraph()
+            note.add_run(f"มูลค่าความเสี่ยงทางการเงินรวมสูงสุด (Total Max Risk Exposure): {float(total_exposure):,.0f} บาท").bold = True
 
     # 4. Evidence Findings
+    photo_refs = _photo_reference_map(uploaded_files)
     _heading(doc, labels[2], 12)
     _table(doc, headers_map["findings"], [
-        [item.get("category"), item.get("source_file"), item.get("observed_data"), item.get("engineering_diagnosis"), item.get("severity")]
+        [
+            item.get("category"),
+            f"{item.get('source_file')} (ดูภาพที่ {photo_refs[item.get('source_file')]})"
+            if item.get("source_file") in photo_refs else item.get("source_file"),
+            item.get("observed_data"), item.get("engineering_diagnosis"), item.get("severity"),
+        ]
         for item in report.get("evidence_findings", []) if isinstance(item, dict)
     ], severity_column=4)
 
@@ -218,7 +255,7 @@ def build_docx(report: dict, uploaded_files=None) -> io.BytesIO:
     # 8. Appendix Photos
     if uploaded_files:
         _heading(doc, labels[6], 12)
-        _add_photos(doc, uploaded_files)
+        _add_photos(doc, uploaded_files, photo_refs)
 
     output = io.BytesIO()
     doc.save(output)

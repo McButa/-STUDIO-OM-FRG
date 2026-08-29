@@ -100,6 +100,41 @@ def init_database():
     if "audit_id" not in audit_columns:
         cursor.execute("ALTER TABLE audits ADD COLUMN audit_id TEXT")
 
+    # 4. FTS5 index for fast, relevance-ranked similar-case search (falls back gracefully if unavailable)
+    try:
+        cursor.execute("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS incident_cases_fts USING fts5(
+            alarm_or_finding, root_cause, category, content='incident_cases', content_rowid='id'
+        )
+        """)
+        fts_count = cursor.execute("SELECT COUNT(*) FROM incident_cases_fts").fetchone()[0]
+        real_count = cursor.execute("SELECT COUNT(*) FROM incident_cases").fetchone()[0]
+        if fts_count == 0 and real_count > 0:
+            cursor.execute("""
+            INSERT INTO incident_cases_fts (rowid, alarm_or_finding, root_cause, category)
+            SELECT id, COALESCE(alarm_or_finding, ''), COALESCE(root_cause, ''), COALESCE(category, '')
+            FROM incident_cases
+            """)
+    except sqlite3.OperationalError:
+        pass  # SQLite build without FTS5 support; get_similar_cases_context falls back to LIKE search
+
+    # 5. Inaction damage line items (for SUM-based financial exposure dashboards)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS inaction_damage_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        audit_id TEXT,
+        plant_id INTEGER,
+        identified_fault TEXT,
+        component_at_risk TEXT,
+        min_damage_cost_thb REAL DEFAULT 0,
+        max_damage_cost_thb REAL DEFAULT 0,
+        min_prevention_cost_thb REAL DEFAULT 0,
+        max_prevention_cost_thb REAL DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (plant_id) REFERENCES plants(id)
+    )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -138,28 +173,64 @@ def get_plant_history_context(plant_name: str, report_type: str = "") -> str:
     conn.close()
     return context
 
-def get_similar_cases_context(keywords: list, report_type: str, plant_name: str = "") -> str:
-    """ค้นหาเคสปัญหาที่มีการบันทึกจริงจากช่างเท่านั้น"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    
+def _similar_cases_like_fallback(keywords: list, type_filter: str, plant_filter: str, cursor) -> list:
+    """Original LIKE-based search — used only if this SQLite build lacks FTS5."""
     cases_found = []
-    type_filter = (report_type or "DIAGNOSTIC").strip().upper()
-    plant_filter = (plant_name or "").strip()
     for kw in keywords:
-        if len(str(kw).strip()) < 3: continue
-        cursor.execute("""
+        if len(str(kw).strip()) < 3:
+            continue
+        cases_found.extend(cursor.execute("""
         SELECT p.name as plant_name, c.alarm_or_finding, c.root_cause, c.verified_solution, c.parts_used
         FROM incident_cases c
         JOIN plants p ON c.plant_id = p.id
-                WHERE c.report_type = ?
-                    AND c.approved_at IS NOT NULL
-                    AND p.approved_at IS NOT NULL
-                    AND (? = '' OR p.name = ?)
-                    AND (c.category LIKE ? OR c.alarm_or_finding LIKE ?)
-        LIMIT 2
-                """, (type_filter, plant_filter, plant_filter, f"%{kw}%", f"%{kw}%"))
-        cases_found.extend(cursor.fetchall())
+        WHERE c.report_type = ? AND c.approved_at IS NOT NULL AND p.approved_at IS NOT NULL
+          AND c.verified_solution != '' AND (? = '' OR p.name = ?)
+          AND (c.category LIKE ? OR c.alarm_or_finding LIKE ?)
+        LIMIT 4
+        """, (type_filter, plant_filter, plant_filter, f"%{kw}%", f"%{kw}%")).fetchall())
+    return cases_found
+
+
+def get_similar_cases_context(keywords: list, report_type: str, plant_name: str = "") -> str:
+    """ค้นหาเคสปัญหาที่มีการบันทึกจริงจากช่างเท่านั้น — จัดอันดับด้วย FTS5/BM25 และให้น้ำหนักไซต์เดียวกันก่อน"""
+    conn = get_connection()
+    cursor = conn.cursor()
+    type_filter = (report_type or "DIAGNOSTIC").strip().upper()
+    plant_filter = (plant_name or "").strip()
+    terms = [str(kw).strip() for kw in keywords if len(str(kw).strip()) >= 3]
+
+    cases_found = []
+    if terms:
+        match_query = " OR ".join(f'"{term}"' for term in terms)
+        try:
+            def _fts_search(same_plant_only: bool, limit: int):
+                sql = """
+                SELECT p.name as plant_name, c.alarm_or_finding, c.root_cause, c.verified_solution, c.parts_used
+                FROM incident_cases_fts f
+                JOIN incident_cases c ON c.id = f.rowid
+                JOIN plants p ON c.plant_id = p.id
+                WHERE incident_cases_fts MATCH ?
+                  AND c.report_type = ? AND c.approved_at IS NOT NULL AND p.approved_at IS NOT NULL
+                  AND c.verified_solution != ''
+                """
+                params = [match_query, type_filter]
+                if same_plant_only:
+                    sql += " AND p.name = ?"
+                    params.append(plant_filter)
+                sql += " ORDER BY bm25(incident_cases_fts) LIMIT ?"
+                params.append(limit)
+                return cursor.execute(sql, params).fetchall()
+
+            if plant_filter:
+                cases_found.extend(_fts_search(True, 5))
+            if len(cases_found) < 3:
+                seen_pairs = {(c["alarm_or_finding"], c["plant_name"]) for c in cases_found}
+                for row in _fts_search(False, 8):
+                    if (row["alarm_or_finding"], row["plant_name"]) not in seen_pairs:
+                        cases_found.append(row)
+                        seen_pairs.add((row["alarm_or_finding"], row["plant_name"]))
+        except sqlite3.OperationalError:
+            cases_found = _similar_cases_like_fallback(terms, type_filter, plant_filter, cursor)
 
     conn.close()
     if not cases_found:
@@ -167,13 +238,19 @@ def get_similar_cases_context(keywords: list, report_type: str, plant_name: str 
 
     context = "\n[แนวทางแก้ไขมาตรฐานจากเคสจริงในอดีตของ STUDIO OM]\n"
     seen = set()
+    token_budget_chars = 1500
     for c in cases_found:
-        if c["alarm_or_finding"] not in seen:
-            seen.add(c["alarm_or_finding"])
-            context += f"• ปัญหา: {c['alarm_or_finding']} (ไซต์ {c['plant_name']})\n"
-            context += f"  - วิธีแก้ไขที่ทำสำเร็จ: {c['verified_solution']}\n"
-            context += f"  - อะไหล่ที่ใช้: {c['parts_used']}\n"
-            
+        if c["alarm_or_finding"] in seen:
+            continue
+        entry = (
+            f"• ปัญหา: {c['alarm_or_finding']} (ไซต์ {c['plant_name']})\n"
+            f"  - วิธีแก้ไขที่ทำสำเร็จ: {c['verified_solution']}\n"
+            f"  - อะไหล่ที่ใช้: {c['parts_used']}\n"
+        )
+        if len(context) + len(entry) > token_budget_chars:
+            break
+        seen.add(c["alarm_or_finding"])
+        context += entry
     return context
 
 
@@ -251,8 +328,14 @@ def save_audit(plant_name, audit_date, status, active_power_kw, grid_current_a, 
     conn.close()
     return audit_id
 
-def save_approved_report_to_db(data: dict):
-    """บันทึกข้อมูลเข้า Database เฉพาะเมื่อวิศวกรกดปุ่มอนุมัติด้วยตัวเองเท่านั้น"""
+def save_approved_report_to_db(data: dict, report_type: str = "", engineer_solutions: list | None = None):
+    """บันทึกข้อมูลเข้า Database เฉพาะเมื่อวิศวกรกดปุ่มอนุมัติด้วยตัวเองเท่านั้น
+
+    report_type: ประเภทงานจริงของ job นี้ (MASTER_REPORT/MIXED_REPORT ฯลฯ) — ต้องตรงกับที่ใช้ค้นหาใน
+      get_similar_cases_context ไม่งั้นเคสที่บันทึกจะไม่มีวันถูกดึงกลับมาใช้
+    engineer_solutions: list ที่ index ตรงกับ data["evidence_findings"] แต่ละตัวเป็น
+      {"solution": "...", "parts": "..."} ที่วิศวกรกรอกตอนอนุมัติ (เว้นว่างได้สำหรับ finding ที่ไม่ต้องแก้)
+    """
     conn = get_connection()
     cursor = conn.cursor()
     
@@ -260,6 +343,7 @@ def save_approved_report_to_db(data: dict):
     plant_name = str(p_info.get("plant_name") or "").strip()
     if not plant_name or plant_name == "Unknown Site":
         plant_name = f"Site_{datetime.now().strftime('%Y%m%d_%H%M')}"
+    resolved_report_type = (report_type or data.get("report_type") or "DIAGNOSTIC").strip().upper()
     
     # 1. บันทึก Plant
     cursor.execute("SELECT id FROM plants WHERE name = ? AND approved_at IS NOT NULL", (plant_name,))
@@ -278,7 +362,7 @@ def save_approved_report_to_db(data: dict):
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         plant_id,
-        data.get("report_type", "DIAGNOSTIC"),
+        resolved_report_type,
         p_info.get("audit_date", datetime.today().strftime("%d %B %Y")),
         "STUDIO OM Solar O&M Engineering Report",
         data.get("executive_summary", ""),
@@ -308,18 +392,63 @@ def save_approved_report_to_db(data: dict):
         ),
     )
 
-    # 3. บันทึกเคสปัญหาเฉพาะรายงานที่มีหลักฐานปัญหาทางเทคนิค
-    report_type = "MASTER_REPORT"
-    for item in data.get("evidence_findings", []):
-        if isinstance(item, dict) and item.get("observed_data"):
-            cursor.execute("""
-            INSERT INTO incident_cases (plant_id, report_type, category, equipment, alarm_or_finding, root_cause, verified_solution, parts_used, approved_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (plant_id, report_type, item.get("category", "-"), item.get("source_file", ""), item.get("observed_data", ""), item.get("engineering_diagnosis", ""), "", "", datetime.now().isoformat(timespec="seconds")))
+    # 3. บันทึกเคสปัญหาพร้อมวิธีแก้จริงจากวิศวกร (ถ้ามี) + sync เข้า FTS5 index
+    has_fts = True
+    for index, item in enumerate(data.get("evidence_findings", [])):
+        if not (isinstance(item, dict) and item.get("observed_data")):
+            continue
+        sol_entry = (engineer_solutions[index] if engineer_solutions and index < len(engineer_solutions) else {}) or {}
+        verified_solution = str(sol_entry.get("solution") or "")
+        parts_used = str(sol_entry.get("parts") or "")
+        cursor.execute("""
+        INSERT INTO incident_cases (plant_id, report_type, category, equipment, alarm_or_finding, root_cause, verified_solution, parts_used, approved_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (plant_id, resolved_report_type, item.get("category", "-"), item.get("source_file", ""), item.get("observed_data", ""), item.get("engineering_diagnosis", ""), verified_solution, parts_used, datetime.now().isoformat(timespec="seconds")))
+        incident_id = cursor.lastrowid
+        if has_fts and verified_solution:
+            try:
+                cursor.execute(
+                    "INSERT INTO incident_cases_fts (rowid, alarm_or_finding, root_cause, category) VALUES (?, ?, ?, ?)",
+                    (incident_id, item.get("observed_data", ""), item.get("engineering_diagnosis", ""), item.get("category", "")),
+                )
+            except sqlite3.OperationalError:
+                has_fts = False  # FTS5 not available in this SQLite build; skip silently
+
+    # 4. บันทึกรายการความเสียหายต่อเนื่อง (สำหรับ dashboard SUM ความเสี่ยงรวม)
+    audit_id = data.get("analysis_metadata", {}).get("audit_id", "")
+    for item in data.get("inaction_damage_matrix", []):
+        if not isinstance(item, dict):
+            continue
+        cursor.execute("""
+        INSERT INTO inaction_damage_items
+        (audit_id, plant_id, identified_fault, component_at_risk, min_damage_cost_thb, max_damage_cost_thb, min_prevention_cost_thb, max_prevention_cost_thb)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            audit_id, plant_id, item.get("identified_fault", ""), item.get("component_at_risk", ""),
+            float(item.get("min_damage_cost_thb") or 0), float(item.get("max_damage_cost_thb") or 0),
+            float(item.get("min_prevention_cost_thb") or 0), float(item.get("max_prevention_cost_thb") or 0),
+        ))
 
     conn.commit()
     conn.close()
     return report_id
+
+def get_total_damage_exposure(plant_name: str = "") -> float:
+    """SUM ความเสี่ยงทางการเงินสูงสุด (max_damage_cost_thb) รวมทั้งหมด หรือกรองเฉพาะไซต์เดียว สำหรับ dashboard"""
+    conn = get_connection()
+    cursor = conn.cursor()
+    if plant_name.strip():
+        cursor.execute("""
+        SELECT COALESCE(SUM(d.max_damage_cost_thb), 0)
+        FROM inaction_damage_items d JOIN plants p ON d.plant_id = p.id
+        WHERE p.name = ?
+        """, (plant_name.strip(),))
+    else:
+        cursor.execute("SELECT COALESCE(SUM(max_damage_cost_thb), 0) FROM inaction_damage_items")
+    total = cursor.fetchone()[0]
+    conn.close()
+    return float(total or 0)
+
 
 # สร้างตารางเปล่าทันที
 init_database()
