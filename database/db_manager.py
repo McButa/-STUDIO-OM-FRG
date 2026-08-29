@@ -2,6 +2,7 @@ import sqlite3
 import json
 import os
 from datetime import datetime
+from typing import Optional
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "studio_om.db")
 
@@ -328,7 +329,7 @@ def save_audit(plant_name, audit_date, status, active_power_kw, grid_current_a, 
     conn.close()
     return audit_id
 
-def save_approved_report_to_db(data: dict, report_type: str = "", engineer_solutions: list | None = None):
+def save_approved_report_to_db(data: dict, report_type: str = "", engineer_solutions: Optional[list] = None):
     """บันทึกข้อมูลเข้า Database เฉพาะเมื่อวิศวกรกดปุ่มอนุมัติด้วยตัวเองเท่านั้น
 
     report_type: ประเภทงานจริงของ job นี้ (MASTER_REPORT/MIXED_REPORT ฯลฯ) — ต้องตรงกับที่ใช้ค้นหาใน
