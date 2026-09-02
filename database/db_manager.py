@@ -4,16 +4,15 @@ import os
 from datetime import datetime
 from typing import Optional
 
-# ชี้ Path ไปที่โฟลเดอร์ database เสมอ (ถ้าไม่มีไฟล์ studio_om.db เดี๋ยว SQLite จะสร้างให้เองอัตโนมัติ)
 DB_PATH = os.path.join(os.path.dirname(__file__), "studio_om.db")
 
 def get_connection():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
 def init_database():
-    """สร้างเฉพาะโครงสร้างตารางเปล่า 100% อัตโนมัติ (ห้ามใส่ Seed Data หรือข้อมูลจำลอง)"""
+    """สร้างและอัปเดตโครงสร้างตาราง SQLite อัตโนมัติ (Safe Schema Migration)"""
     conn = get_connection()
     cursor = conn.cursor()
 
@@ -35,7 +34,7 @@ def init_database():
     CREATE TABLE IF NOT EXISTS reports (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         plant_id INTEGER,
-        report_type TEXT NOT NULL,
+        report_type TEXT NOT NULL DEFAULT 'DIAGNOSTIC',
         report_date TEXT,
         report_title TEXT,
         summary_text TEXT,
@@ -51,7 +50,7 @@ def init_database():
     )
     """)
 
-    # 3. ตาราง Audits
+    # 3. ตารางประวัติ Audits
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS audits (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -85,7 +84,7 @@ def init_database():
     )
     """)
 
-    # 5. Inaction damage line items
+    # 5. ตารางความเสียหายทางการเงิน
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS inaction_damage_items (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -102,7 +101,27 @@ def init_database():
     )
     """)
 
-    # 6. FTS5 index for fast search
+    # Migration: ตรวจสอบและเพิ่มคอลัมน์ที่อาจขาดหายในกรณีฐานข้อมูลเดิม
+    def ensure_column(table: str, column: str, col_type: str):
+        cols = {row[1] for row in cursor.execute(f"PRAGMA table_info({table})").fetchall()}
+        if column not in cols:
+            try:
+                cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+            except sqlite3.OperationalError:
+                pass
+
+    ensure_column("plants", "approved_at", "TIMESTAMP")
+    ensure_column("reports", "audit_id", "TEXT")
+    ensure_column("reports", "status", "TEXT")
+    ensure_column("reports", "docx_path", "TEXT")
+    ensure_column("reports", "approved_at", "TIMESTAMP")
+    ensure_column("reports", "full_data_json", "TEXT")
+    ensure_column("audits", "audit_id", "TEXT")
+    ensure_column("audits", "docx_path", "TEXT")
+    ensure_column("incident_cases", "report_type", "TEXT NOT NULL DEFAULT 'DIAGNOSTIC'")
+    ensure_column("incident_cases", "approved_at", "TIMESTAMP")
+
+    # FTS5 Index สำหรับค้นหาเคส
     try:
         cursor.execute("""
         CREATE VIRTUAL TABLE IF NOT EXISTS incident_cases_fts USING fts5(
@@ -110,14 +129,12 @@ def init_database():
         )
         """)
     except sqlite3.OperationalError:
-        pass  # SQLite build without FTS5 support
+        pass
 
     conn.commit()
     conn.close()
 
-
 def get_plant_history_context(plant_name: str, report_type: str = "") -> str:
-    """ดึงประวัติเฉพาะเมื่อไซต์นั้นมีชื่อตรงกับใน Database จริงๆ เท่านั้น ถ้าไม่พบให้ส่งค่าว่าง"""
     if not plant_name or plant_name == "Unknown Site":
         return ""
 
@@ -131,8 +148,8 @@ def get_plant_history_context(plant_name: str, report_type: str = "") -> str:
         return ""
 
     context = f"\n[ข้อมูลประวัติจริงของไซต์ {plant['name']} จากบันทึกในอดีต]\n"
-    context += f"• ขนาดติดตั้ง: {plant['capacity_kwp']}\n"
-    context += f"• ข้อมูลอุปกรณ์: {plant['inverter_info']}\n"
+    context += f"• ขนาดติดตั้ง: {plant['capacity_kwp'] or '-'}\n"
+    context += f"• ข้อมูลอุปกรณ์: {plant['inverter_info'] or '-'}\n"
 
     if report_type:
         cursor.execute(
@@ -150,9 +167,7 @@ def get_plant_history_context(plant_name: str, report_type: str = "") -> str:
     conn.close()
     return context
 
-
 def _similar_cases_like_fallback(keywords: list, type_filter: str, plant_filter: str, cursor) -> list:
-    """Original LIKE-based search — used only if this SQLite build lacks FTS5."""
     cases_found = []
     for kw in keywords:
         if len(str(kw).strip()) < 3:
@@ -168,9 +183,7 @@ def _similar_cases_like_fallback(keywords: list, type_filter: str, plant_filter:
         """, (type_filter, plant_filter, plant_filter, f"%{kw}%", f"%{kw}%")).fetchall())
     return cases_found
 
-
 def get_similar_cases_context(keywords: list, report_type: str, plant_name: str = "") -> str:
-    """ค้นหาเคสปัญหาที่มีการบันทึกจริงจากช่างเท่านั้น"""
     conn = get_connection()
     cursor = conn.cursor()
     type_filter = (report_type or "DIAGNOSTIC").strip().upper()
@@ -231,25 +244,30 @@ def get_similar_cases_context(keywords: list, report_type: str, plant_name: str 
         context += entry
     return context
 
-
 def get_all_audits() -> list[dict]:
-    """Return audit summaries for the historical-memory tab."""
+    """ดึงรายงานทั้งหมดอย่างปลอดภัย ไม่ทำให้ระบบ crash"""
     conn = get_connection()
-    rows = conn.execute("""
-        SELECT id, audit_id, created_at, plant_name, audit_date, status,
-               active_power_kw, grid_current_a, summary_json, docx_path
-        FROM audits ORDER BY created_at DESC, id DESC
-    """).fetchall()
-    if not rows:
+    try:
         rows = conn.execute("""
-        SELECT r.id, audit_id, report_date, status, docx_path, full_data_json,
-               p.name AS plant_name
-        FROM reports r
-        JOIN plants p ON p.id = r.plant_id
-        WHERE r.approved_at IS NOT NULL
-        ORDER BY r.id DESC
+            SELECT id, audit_id, created_at, plant_name, audit_date, status,
+                   active_power_kw, grid_current_a, summary_json, docx_path
+            FROM audits ORDER BY created_at DESC, id DESC
         """).fetchall()
-    conn.close()
+        
+        if not rows:
+            rows = conn.execute("""
+            SELECT r.id, r.audit_id, r.report_date, r.status, r.docx_path, r.full_data_json,
+                   p.name AS plant_name
+            FROM reports r
+            JOIN plants p ON p.id = r.plant_id
+            WHERE r.approved_at IS NOT NULL
+            ORDER BY r.id DESC
+            """).fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    finally:
+        conn.close()
+
     audits = []
     for row in rows:
         item = dict(row)
@@ -259,56 +277,35 @@ def get_all_audits() -> list[dict]:
         except (TypeError, ValueError):
             full_data = {}
         summary = full_data.get("plant_summary", {}) if isinstance(full_data, dict) else {}
-        item["active_power_kw"] = summary.get("active_power_kw", "")
+        item["active_power_kw"] = summary.get("active_power_kw", item.get("active_power_kw", ""))
         item["executive_summary"] = full_data.get("executive_summary", "") if isinstance(full_data, dict) else ""
         audits.append(item)
     return audits
 
-
 def get_audit_by_id(audit_id: str) -> dict | None:
-    """Load one approved audit and its serialized master report."""
     conn = get_connection()
     row = conn.execute(
         "SELECT summary_json, docx_path FROM audits WHERE audit_id = ? OR id = ? OR CAST(id AS TEXT) = ?",
-        (str(audit_id), audit_id, str(audit_id)),
+        (str(audit_id), str(audit_id), str(audit_id)),
     ).fetchone()
     if not row:
         row = conn.execute(
-        "SELECT full_data_json, docx_path FROM reports WHERE audit_id = ? AND approved_at IS NOT NULL",
-        (audit_id,),
+            "SELECT full_data_json, docx_path FROM reports WHERE audit_id = ? AND approved_at IS NOT NULL",
+            (str(audit_id),),
         ).fetchone()
     conn.close()
     if not row:
         return None
     try:
-        report = json.loads((row["summary_json"] if "summary_json" in row.keys() else row["full_data_json"]) or "{}")
+        raw_json = row["summary_json"] if "summary_json" in row.keys() and row["summary_json"] else row["full_data_json"]
+        report = json.loads(raw_json or "{}")
     except (TypeError, ValueError):
         report = {}
     report["analysis_metadata"] = report.get("analysis_metadata", {})
     report["analysis_metadata"]["docx_path"] = row["docx_path"] or report["analysis_metadata"].get("docx_path", "")
     return report
 
-
-def save_audit(plant_name, audit_date, status, active_power_kw, grid_current_a, summary_json, docx_path, audit_id=""):
-    """Save one audit in the dedicated historical-memory table and return its ID."""
-    conn = get_connection()
-    cursor = conn.execute(
-        """INSERT INTO audits
-        (audit_id, plant_name, audit_date, status, active_power_kw, grid_current_a, summary_json, docx_path)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (str(audit_id or ""), str(plant_name or ""), str(audit_date or ""), str(status or ""),
-         str(active_power_kw or ""), str(grid_current_a or ""),
-         json.dumps(summary_json, ensure_ascii=False) if not isinstance(summary_json, str) else summary_json,
-         str(docx_path or "")),
-    )
-    audit_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
-    return audit_id
-
-
 def save_approved_report_to_db(data: dict, report_type: str = "", engineer_solutions: Optional[list] = None):
-    """บันทึกข้อมูลเข้า Database เฉพาะเมื่อวิศวกรกดปุ่มอนุมัติด้วยตัวเองเท่านั้น"""
     conn = get_connection()
     cursor = conn.cursor()
     
@@ -318,21 +315,21 @@ def save_approved_report_to_db(data: dict, report_type: str = "", engineer_solut
         plant_name = f"Site_{datetime.now().strftime('%Y%m%d_%H%M')}"
     resolved_report_type = (report_type or data.get("report_type") or "DIAGNOSTIC").strip().upper()
     
-    # 1. บันทึก Plant
     cursor.execute("SELECT id FROM plants WHERE name = ? AND approved_at IS NOT NULL", (plant_name,))
     row = cursor.fetchone()
     if row:
         plant_id = row["id"]
     else:
         cap_val = str(p_info.get("rated_capacity_kw") or "")
-        cursor.execute("INSERT INTO plants (name, location, capacity_kwp, inverter_info, approved_at) VALUES (?, ?, ?, ?, ?)",
-                   (plant_name, "", cap_val, "", datetime.now().isoformat(timespec="seconds")))
+        cursor.execute(
+            "INSERT INTO plants (name, location, capacity_kwp, inverter_info, approved_at) VALUES (?, ?, ?, ?, ?)",
+            (plant_name, "", cap_val, "", datetime.now().isoformat(timespec="seconds"))
+        )
         plant_id = cursor.lastrowid
 
-    # 2. บันทึก Report
     cursor.execute("""
-        INSERT INTO reports (plant_id, report_type, report_date, report_title, summary_text, tools_used, kpi_json, full_data_json, audit_id, status, docx_path)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO reports (plant_id, report_type, report_date, report_title, summary_text, tools_used, kpi_json, full_data_json, audit_id, status, docx_path, approved_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         plant_id,
         resolved_report_type,
@@ -345,27 +342,25 @@ def save_approved_report_to_db(data: dict, report_type: str = "", engineer_solut
         data.get("analysis_metadata", {}).get("audit_id", ""),
         p_info.get("overall_status", ""),
         data.get("analysis_metadata", {}).get("docx_path", ""),
+        datetime.now().isoformat(timespec="seconds"),
     ))
     report_id = cursor.lastrowid
-    cursor.execute("UPDATE reports SET approved_at = ? WHERE id = ?", (datetime.now().isoformat(timespec="seconds"), report_id))
 
-    cursor.execute(
-        """INSERT INTO audits
+    cursor.execute("""
+        INSERT INTO audits
         (audit_id, plant_name, audit_date, status, active_power_kw, grid_current_a, summary_json, docx_path)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            data.get("analysis_metadata", {}).get("audit_id", ""),
-            plant_name,
-            p_info.get("audit_date", ""),
-            p_info.get("overall_status", ""),
-            p_info.get("active_power_kw", ""),
-            p_info.get("grid_current_a", ""),
-            json.dumps(data, ensure_ascii=False),
-            data.get("analysis_metadata", {}).get("docx_path", ""),
-        ),
-    )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        data.get("analysis_metadata", {}).get("audit_id", ""),
+        plant_name,
+        p_info.get("audit_date", ""),
+        p_info.get("overall_status", ""),
+        p_info.get("active_power_kw", ""),
+        p_info.get("grid_current_a", ""),
+        json.dumps(data, ensure_ascii=False),
+        data.get("analysis_metadata", {}).get("docx_path", ""),
+    ))
 
-    # 3. บันทึกเคสปัญหาพร้อมวิธีแก้จริงจากวิศวกร
     has_fts = True
     for index, item in enumerate(data.get("evidence_findings", [])):
         if not (isinstance(item, dict) and item.get("observed_data")):
@@ -374,9 +369,13 @@ def save_approved_report_to_db(data: dict, report_type: str = "", engineer_solut
         verified_solution = str(sol_entry.get("solution") or "")
         parts_used = str(sol_entry.get("parts") or "")
         cursor.execute("""
-        INSERT INTO incident_cases (plant_id, report_type, category, equipment, alarm_or_finding, root_cause, verified_solution, parts_used, approved_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (plant_id, resolved_report_type, item.get("category", "-"), item.get("source_file", ""), item.get("observed_data", ""), item.get("engineering_diagnosis", ""), verified_solution, parts_used, datetime.now().isoformat(timespec="seconds")))
+            INSERT INTO incident_cases (plant_id, report_type, category, equipment, alarm_or_finding, root_cause, verified_solution, parts_used, approved_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            plant_id, resolved_report_type, item.get("category", "-"), item.get("source_file", ""),
+            item.get("observed_data", ""), item.get("engineering_diagnosis", ""),
+            verified_solution, parts_used, datetime.now().isoformat(timespec="seconds")
+        ))
         incident_id = cursor.lastrowid
         if has_fts and verified_solution:
             try:
@@ -387,15 +386,14 @@ def save_approved_report_to_db(data: dict, report_type: str = "", engineer_solut
             except sqlite3.OperationalError:
                 has_fts = False
 
-    # 4. บันทึกรายการความเสียหายต่อเนื่อง
     audit_id = data.get("analysis_metadata", {}).get("audit_id", "")
     for item in data.get("inaction_damage_matrix", []):
         if not isinstance(item, dict):
             continue
         cursor.execute("""
-        INSERT INTO inaction_damage_items
-        (audit_id, plant_id, identified_fault, component_at_risk, min_damage_cost_thb, max_damage_cost_thb, min_prevention_cost_thb, max_prevention_cost_thb)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO inaction_damage_items
+            (audit_id, plant_id, identified_fault, component_at_risk, min_damage_cost_thb, max_damage_cost_thb, min_prevention_cost_thb, max_prevention_cost_thb)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             audit_id, plant_id, item.get("identified_fault", ""), item.get("component_at_risk", ""),
             float(item.get("min_damage_cost_thb") or 0), float(item.get("max_damage_cost_thb") or 0),
@@ -406,7 +404,6 @@ def save_approved_report_to_db(data: dict, report_type: str = "", engineer_solut
     conn.close()
     return report_id
 
-
 def get_previous_audit_kpis(plant_name: str) -> Optional[dict]:
     plant_name = (plant_name or "").strip()
     if not plant_name:
@@ -414,22 +411,21 @@ def get_previous_audit_kpis(plant_name: str) -> Optional[dict]:
     conn = get_connection()
     cursor = conn.cursor()
     row = cursor.execute("""
-    SELECT audit_date, status, active_power_kw, grid_current_a
-    FROM audits WHERE plant_name = ? ORDER BY id DESC LIMIT 1
+        SELECT audit_date, status, active_power_kw, grid_current_a
+        FROM audits WHERE plant_name = ? ORDER BY id DESC LIMIT 1
     """, (plant_name,)).fetchone()
     conn.close()
     return dict(row) if row else None
 
-
-def get_total_inaction_risk(plant_name: str = "") -> float:
-    """SUM ความเสี่ยงทางการเงินสูงสุด (max_damage_cost_thb) รวมทั้งหมด หรือกรองเฉพาะไซต์เดียว สำหรับ dashboard"""
+def get_total_damage_exposure(plant_name: str = "") -> float:
+    """SUM ความเสี่ยงทางการเงินสูงสุด (max_damage_cost_thb) รวมทั้งหมด หรือกรองเฉพาะไซต์เดียว"""
     conn = get_connection()
     cursor = conn.cursor()
     if plant_name.strip():
         cursor.execute("""
-        SELECT COALESCE(SUM(d.max_damage_cost_thb), 0)
-        FROM inaction_damage_items d JOIN plants p ON d.plant_id = p.id
-        WHERE p.name = ?
+            SELECT COALESCE(SUM(d.max_damage_cost_thb), 0)
+            FROM inaction_damage_items d JOIN plants p ON d.plant_id = p.id
+            WHERE p.name = ?
         """, (plant_name.strip(),))
     else:
         cursor.execute("SELECT COALESCE(SUM(max_damage_cost_thb), 0) FROM inaction_damage_items")
@@ -437,6 +433,5 @@ def get_total_inaction_risk(plant_name: str = "") -> float:
     conn.close()
     return float(total or 0)
 
-
-# สร้างตารางอัตโนมัติทันทีเมื่อแอปเริ่มทำงาน
+# ทำการ initialize โครงสร้างทันทีเมื่อโหลดโมดูล
 init_database()
