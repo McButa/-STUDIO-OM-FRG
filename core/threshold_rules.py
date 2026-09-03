@@ -39,7 +39,10 @@ MEASUREMENT_RULES = [
     {
         "name": "insulation_resistance_live",
         "applies_to_category": "Inverter & Monitoring",
-        "label_pattern": re.compile(r"insulation\s*resistance", re.IGNORECASE),
+        "label_pattern": re.compile(
+            r"insulation\s*resistance|ค่าฉนวน|ความต้านทานฉนวน|\briso\b",
+            re.IGNORECASE,
+        ),
         "value_pattern": re.compile(r"(>|<)?\s*([\d.]+)\s*(?:m\W?ohm|m\W?\u03a9|megaohm)", re.IGNORECASE),
         # (comparator, limit, severity) — value compared against limit.
         "thresholds": [("<", 0.5, "CRITICAL"), ("<", 1.0, "WARNING")],

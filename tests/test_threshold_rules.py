@@ -5,7 +5,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from core.threshold_rules import apply_measurement_thresholds, detect_cross_source_conflicts
+from core.threshold_rules import apply_measurement_thresholds, derive_plant_totals, detect_cross_source_conflicts
 from router import _enforce_engineering_rules
 
 
@@ -113,6 +113,68 @@ def test_no_conflict_flagged_when_both_sources_agree():
     assert len(report["evidence_findings"]) == 2  # nothing appended
 
 
+def test_thai_label_ka_chanuan_is_also_caught_not_just_english_wording():
+    """The real 2026-09-03 report writer output '...ค่าฉนวน 0.836 MOhm' — Thai
+    for insulation value — instead of the English phrase. An English-only
+    regex would have silently missed this and shipped the exact same bug
+    again under a different label."""
+    report = _report([
+        _finding(
+            "Inverter & Monitoring", "Inv_2.jpg",
+            "Active power 3.867 kW, ค่าฉนวน 0.836 MOhm",
+            severity="NORMAL", diagnosis="ค่าฉนวนอยู่ในเกณฑ์ยอมรับได้",
+        ),
+    ])
+    report, locked = apply_measurement_thresholds(report)
+    assert report["evidence_findings"][0]["severity"] == "WARNING"
+
+
+# --- Deterministic recovery of plant-level totals ------------------------
+
+def test_unconfirmed_active_power_is_summed_from_per_inverter_readings():
+    """Live run on 2026-09-03: the top summary line showed 'กำลังผลิตจริง:
+    UNCONFIRMED' even though every single Inverter & Monitoring finding had a
+    real Active power reading (3.867, 3.925, 4.165 kW, ...). Summing is not
+    an LLM judgment call — do it in Python whenever the per-item numbers are
+    actually present in evidence_findings."""
+    report = {
+        "plant_summary": {"overall_status": "WARNING", "active_power_kw": "UNCONFIRMED"},
+        "evidence_findings": [
+            _finding("Inverter & Monitoring", "Inv_1.jpg", "Active power: 1.067 kW"),
+            _finding("Inverter & Monitoring", "Inv_2.jpg", "Active power: 3.867 kW"),
+            _finding("Inverter & Monitoring", "Inv_3.jpg", "Active power: 3.925 kW"),
+        ],
+    }
+    report = derive_plant_totals(report)
+    assert report["plant_summary"]["active_power_kw"] == "8.859"
+
+
+def test_partial_per_inverter_data_is_not_summed_to_avoid_understating_output():
+    # Only 2 of 3 inverter findings have a parseable reading — summing just
+    # those two would silently under-report total output, so leave it alone.
+    report = {
+        "plant_summary": {"overall_status": "NORMAL", "active_power_kw": None},
+        "evidence_findings": [
+            _finding("Inverter & Monitoring", "Inv_1.jpg", "Active power: 1.067 kW"),
+            _finding("Inverter & Monitoring", "Inv_2.jpg", "Active power: 3.867 kW"),
+            _finding("Inverter & Monitoring", "Inv_3.jpg", "Inverter offline, no reading"),
+        ],
+    }
+    report = derive_plant_totals(report)
+    assert report["plant_summary"]["active_power_kw"] is None
+
+
+def test_existing_active_power_value_is_never_overwritten():
+    report = {
+        "plant_summary": {"overall_status": "NORMAL", "active_power_kw": "18.2"},
+        "evidence_findings": [
+            _finding("Inverter & Monitoring", "Inv_1.jpg", "Active power: 999 kW"),
+        ],
+    }
+    report = derive_plant_totals(report)
+    assert report["plant_summary"]["active_power_kw"] == "18.2"
+
+
 # --- Coverage for router's existing hard-coded rules (previously untested) --
 
 def test_zero_grid_current_locks_critical():
@@ -143,3 +205,32 @@ def test_normal_with_zero_alarms_keeps_normal():
     report, locked = _enforce_engineering_rules(report)
     assert report["plant_summary"]["overall_status"] == "NORMAL"
     assert locked is False
+
+
+def test_negated_ground_fault_mention_does_not_lock_critical():
+    """GBN - Phitsanulok report: every finding says NORMAL and the text reads
+    'ไม่พบภาวะกราวด์ฟอลต์ (Ground Fault)' — Thai for 'no ground fault found' —
+    but a naive substring search for 'ground fault' still matched and forced
+    the whole report to CRITICAL despite every finding being NORMAL."""
+    report = {
+        "plant_summary": {"overall_status": "NORMAL", "active_power_kw": "18.201", "rated_capacity_kw": "680", "grid_current_a": "26.969"},
+        "evidence_findings": [{
+            "observed_data": "วงจร DC สตริงทั้งหมดเชื่อมต่อทางไฟฟ้าอย่างสมบูรณ์",
+            "engineering_diagnosis": "ขั้วต่อและสายโซลาร์เคเบิลมีสภาพความเป็นฉนวนสมบูรณ์ ไม่พบภาวะกราวด์ฟอลต์ (Ground Fault) หรือสายขาดวงจร",
+        }],
+    }
+    report, locked = _enforce_engineering_rules(report)
+    assert report["plant_summary"]["overall_status"] != "CRITICAL"
+    assert locked is False
+
+
+def test_real_unnegated_ground_fault_still_locks_critical():
+    """Make sure fixing the false positive above didn't break the real case —
+    an actual, unnegated ground fault mention must still lock CRITICAL."""
+    report = {
+        "plant_summary": {"overall_status": "NORMAL"},
+        "evidence_findings": [{"observed_data": "Alarm log shows an active ground fault on string 4", "engineering_diagnosis": ""}],
+    }
+    report, locked = _enforce_engineering_rules(report)
+    assert report["plant_summary"]["overall_status"] == "CRITICAL"
+    assert locked is True
