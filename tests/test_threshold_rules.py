@@ -129,6 +129,105 @@ def test_thai_label_ka_chanuan_is_also_caught_not_just_english_wording():
     assert report["evidence_findings"][0]["severity"] == "WARNING"
 
 
+# --- Structured key_measurements (primary path, added after the schema change) --
+
+def test_structured_insulation_reading_is_used_even_with_no_matching_text():
+    """The whole point of key_measurements: this must work even when the
+    model's prose doesn't mention 'insulation resistance' or 'ค่าฉนวน' at
+    all — exactly the run where the old text-only regex came up empty."""
+    report = _report([
+        {
+            "category": "Inverter & Monitoring", "source_file": "Inv_2.jpg",
+            "observed_data": "หน้าจอแสดงค่าปกติทั่วไป", "engineering_diagnosis": "",
+            "severity": "NORMAL",
+            "key_measurements": [{"parameter": "insulation_resistance_mohm", "value": 0.836, "unit": "MOhm", "comparator": "="}],
+        },
+    ])
+    report, locked = apply_measurement_thresholds(report)
+    assert report["evidence_findings"][0]["severity"] == "WARNING"
+
+
+def test_structured_reading_takes_priority_over_conflicting_text():
+    # If both are present, the structured number wins — it's the field the
+    # prompt now requires to be accurate, text is free-form and can drift.
+    report = _report([
+        {
+            "category": "Inverter & Monitoring", "source_file": "Inv_2.jpg",
+            "observed_data": "Insulation resistance: 20 MOhm (พิมพ์ผิดในข้อความ)",
+            "engineering_diagnosis": "", "severity": "NORMAL",
+            "key_measurements": [{"parameter": "insulation_resistance_mohm", "value": 0.3, "unit": "MOhm", "comparator": "="}],
+        },
+    ])
+    report, locked = apply_measurement_thresholds(report)
+    assert report["evidence_findings"][0]["severity"] == "CRITICAL"
+
+
+def test_comparator_greater_than_in_structured_data_is_not_flagged():
+    # A Megger '>1000 MOhm' reading structured as value=1000, comparator='>'
+    # must not be misread as an exact 1000 that somehow trips a < threshold.
+    report = _report([
+        {
+            "category": "Inverter & Monitoring", "source_file": "Inv_1.jpg",
+            "observed_data": "", "engineering_diagnosis": "", "severity": "NORMAL",
+            "key_measurements": [{"parameter": "insulation_resistance_mohm", "value": 1000, "unit": "MOhm", "comparator": ">"}],
+        },
+    ])
+    report, locked = apply_measurement_thresholds(report)
+    assert report["evidence_findings"][0]["severity"] == "NORMAL"
+
+
+def test_active_power_summed_from_structured_data_across_all_inverters():
+    report = {
+        "plant_summary": {"overall_status": "WARNING", "active_power_kw": "UNCONFIRMED"},
+        "evidence_findings": [
+            {"category": "Inverter & Monitoring", "source_file": "Inv_1.jpg", "observed_data": "", "engineering_diagnosis": "", "severity": "NORMAL",
+             "key_measurements": [{"parameter": "active_power_kw", "value": 1.067, "comparator": "="}]},
+            {"category": "Inverter & Monitoring", "source_file": "Inv_2.jpg", "observed_data": "", "engineering_diagnosis": "", "severity": "WARNING",
+             "key_measurements": [{"parameter": "active_power_kw", "value": 3.867, "comparator": "="}]},
+        ],
+    }
+    report = derive_plant_totals(report)
+    assert report["plant_summary"]["active_power_kw"] == "4.934"
+
+
+def test_structured_and_text_active_power_can_mix_across_findings():
+    # One finding has structured data, another only has it in prose — the
+    # fallback still lets the sum go through instead of giving up entirely.
+    report = {
+        "plant_summary": {"overall_status": "NORMAL", "active_power_kw": None},
+        "evidence_findings": [
+            {"category": "Inverter & Monitoring", "source_file": "Inv_1.jpg", "observed_data": "", "engineering_diagnosis": "", "severity": "NORMAL",
+             "key_measurements": [{"parameter": "active_power_kw", "value": 1.067, "comparator": "="}]},
+            {"category": "Inverter & Monitoring", "source_file": "Inv_2.jpg", "observed_data": "Active power: 3.867 kW", "engineering_diagnosis": "", "severity": "NORMAL",
+             "key_measurements": []},
+        ],
+    }
+    report = derive_plant_totals(report)
+    assert report["plant_summary"]["active_power_kw"] == "4.934"
+
+
+def test_grid_current_and_rated_capacity_are_never_touched_by_this_module():
+    """Physics/engineering guardrail: this module must never invent a plant-
+    level grid_current_a or rated_capacity_kw, even when it could technically
+    sum something — per-inverter currents aren't safely additive without
+    known circuit topology, and rated capacity isn't derivable from photos
+    at all. Only active_power_kw gets an automatic total."""
+    report = {
+        "plant_summary": {"overall_status": "NORMAL", "active_power_kw": "UNCONFIRMED", "grid_current_a": "UNCONFIRMED", "rated_capacity_kw": "UNCONFIRMED"},
+        "evidence_findings": [
+            {"category": "Inverter & Monitoring", "source_file": "Inv_1.jpg", "observed_data": "", "engineering_diagnosis": "", "severity": "NORMAL",
+             "key_measurements": [
+                 {"parameter": "active_power_kw", "value": 1.067, "comparator": "="},
+                 {"parameter": "grid_current_a", "value": 5.6, "comparator": "="},
+             ]},
+        ],
+    }
+    report = derive_plant_totals(report)
+    assert report["plant_summary"]["active_power_kw"] == "1.067"
+    assert report["plant_summary"]["grid_current_a"] == "UNCONFIRMED"
+    assert report["plant_summary"]["rated_capacity_kw"] == "UNCONFIRMED"
+
+
 # --- Deterministic recovery of plant-level totals ------------------------
 
 def test_unconfirmed_active_power_is_summed_from_per_inverter_readings():

@@ -11,6 +11,17 @@ If a value, diagnosis, cause, or action is not visible or proven, use null or "U
 A root cause is proven only by explicit alarm text, measurement evidence, EL evidence, or insulation test evidence.
 Keep observed_data separate from engineering_diagnosis. Cross-correlate independent evidence sources.
 
+STRUCTURED MEASUREMENTS (in addition to, never instead of, the observed_data narrative):
+For every finding, also record every numeric reading you can see as a separate entry in "key_measurements".
+Use these exact parameter names whenever the reading matches one of them (use others only when none of these fit):
+active_power_kw, insulation_resistance_mohm, continuity_resistance_ohm, grid_frequency_hz, power_factor,
+internal_temp_c, daily_energy_kwh, total_yield_kwh, grid_voltage_v, string_current_a, grid_current_a.
+Give "value" as a bare number only (no unit text, no > or < symbol in the number itself).
+If the source reads as an inequality (e.g. "Riso +/G >1000 MOhm" or "<0.5 Ohm"), set "comparator" to ">" or "<"
+accordingly and "value" to that bound — do not silently turn ">1000" into an exact reading of 1000.
+Use "comparator": "=" for a directly read value. Never leave key_measurements empty when a number is visible
+in the evidence, even if that same number is also described in the observed_data text.
+
 CRITICAL INACTION DAMAGE ANALYSIS:
 For each major or critical issue found, analyze the consequential equipment damage that WILL OCCUR if neglected (e.g. Ground fault -> Inverter MPPT power board fire/short-circuit costing 80,000-150,000 THB vs 500-1,500 THB MC4 repair; Hotspot -> Cell delamination/shattered glass costing 4,500-9,000 THB module replacement vs 0-500 THB cleaning).
 Output damage and prevention costs as RAW NUMBERS ONLY (no commas, no currency symbols, no text) in min_damage_cost_thb, max_damage_cost_thb, min_prevention_cost_thb, max_prevention_cost_thb.
@@ -37,7 +48,10 @@ Return JSON only using exactly this schema:
       "source_file": "string",
       "observed_data": "string",
       "engineering_diagnosis": "string",
-      "severity": "CRITICAL|WARNING|NORMAL|INFORMATIONAL"
+      "severity": "CRITICAL|WARNING|NORMAL|INFORMATIONAL",
+      "key_measurements": [
+        {"parameter": "string (see fixed vocabulary above)", "value": 0, "unit": "string", "comparator": "=|>|<"}
+      ]
     }
   ],
   "inaction_damage_matrix": [

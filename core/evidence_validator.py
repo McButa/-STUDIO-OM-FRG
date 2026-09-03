@@ -52,6 +52,22 @@ class PlantSummary(BaseModel):
         return self
 
 
+class Measurement(BaseModel):
+    """One numeric reading, captured as data instead of prose. The LLM's
+    narrative wording changes every run (sometimes 'Active power: 3.867 kW',
+    sometimes nothing at all); a structured field with a fixed vocabulary of
+    parameter names is what makes downstream Python code able to compute
+    totals/thresholds reliably instead of regexing whatever text showed up
+    this time. `comparator` preserves inequality readings honestly — a paper
+    Megger test reported as '>1000 MOhm' is a lower bound, not the number
+    1000, and collapsing that distinction would misrepresent the evidence."""
+    model_config = ConfigDict(extra="ignore")
+    parameter: str
+    value: float | None = None
+    unit: str | None = None
+    comparator: Literal["=", ">", "<"] = "="
+
+
 class EvidenceFinding(BaseModel):
     model_config = ConfigDict(extra="ignore")
     category: Category
@@ -59,6 +75,7 @@ class EvidenceFinding(BaseModel):
     observed_data: str
     engineering_diagnosis: str
     severity: Severity
+    key_measurements: list[Measurement] = Field(default_factory=list)
 
 
 class RootCause(BaseModel):
@@ -147,3 +164,4 @@ def validate_report(data: dict) -> dict:
             cause["description"] = "UNCONFIRMED_HYPOTHESIS"
             cause["supporting_evidence"] = "UNCONFIRMED"
     return result
+

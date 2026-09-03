@@ -2,7 +2,7 @@
 set -e
 cd /workspaces/-STUDIO-OM-FRG
 
-mkdir -p core tests
+mkdir -p core tests engines
 
 cat > app.py << 'PYEOF'
 import base64
@@ -540,6 +540,16 @@ Insulation Resistance reading (0.836 MOhm) came back NORMAL once and WARNING
 once, because nothing in code ever checked the number itself. This module
 fixes that class of bug for measured, numeric values.
 
+Two sources of truth, in priority order:
+  1. `key_measurements` — a structured list the prompt now requires on every
+     evidence_finding (parameter/value/unit/comparator). This is the reliable
+     path: a fixed vocabulary of parameter names, not prose the model phrases
+     differently every run.
+  2. Regex against observed_data/engineering_diagnosis text — kept as a
+     fallback ONLY, for evidence that predates key_measurements or a run
+     where the model still forgot to populate it. Never trusted over
+     structured data when both are present.
+
 Design goal (token/maintenance cost): a NEW failure mode that is expressed as
 "a named quantity crossed a known numeric line" should only require adding one
 entry to MEASUREMENT_RULES below — no prompt edits, no router changes, no new
@@ -550,6 +560,22 @@ too (see `detect_cross_source_conflicts`).
 Severity is only ever UPGRADED by these rules, never downgraded — an LLM call
 that already flagged something worse is left alone; a rule only steps in when
 the LLM under-called a measured value that crosses a known safety line.
+
+What this file deliberately does NOT derive, and why (engineering/physics,
+not just missing code):
+  - grid_current_a at plant level: individual inverters are not guaranteed to
+    be on the same phase, feeder, or measurement point, so their reported
+    currents do not simply add into one meaningful "grid current" figure
+    without knowing the actual electrical topology. Guessing here would be
+    fabricating a number that looks precise but isn't physically justified.
+  - rated_capacity_kw: this is a static nameplate/design value from site
+    metadata, not something visible in a field photo to re-derive. If it's
+    UNCONFIRMED, the fix is ensuring the site metadata reaches the prompt,
+    not inventing a number from evidence that was never going to contain it.
+  Active power IS safe to sum: real power delivered by parallel sources onto
+  a common connection point is additive by basic conservation of energy,
+  regardless of phase relationships — that's why only active_power_kw gets
+  an automatic total below.
 """
 
 import re
@@ -561,17 +587,36 @@ def _higher(a: str, b: str) -> str:
     return a if SEVERITY_RANK.get(a, 0) >= SEVERITY_RANK.get(b, 0) else b
 
 
+def _structured_lookup(finding: dict, parameter_names: set):
+    """Look up a numeric reading from the finding's structured
+    key_measurements list. Returns (value, comparator) or (None, None)."""
+    for measurement in finding.get("key_measurements") or []:
+        if not isinstance(measurement, dict):
+            continue
+        name = str(measurement.get("parameter", "")).strip().lower()
+        if name not in parameter_names:
+            continue
+        value = measurement.get("value")
+        if value is None:
+            continue
+        try:
+            return float(value), measurement.get("comparator", "=") or "="
+        except (TypeError, ValueError):
+            continue
+    return None, None
+
+
 # --- Table of deterministic rules --------------------------------------
-# Each rule finds `label_pattern` in a finding's observed_data/engineering_
-# diagnosis text, reads the following number (handling a leading > or <),
-# and maps it to a severity via `thresholds` (checked in order, first
-# match wins). `applies_to_category` restricts which evidence_findings rows
-# the rule scans, so a rule for a monitoring reading doesn't misfire on a
-# paper Megger row using the same word.
+# Each rule first looks for `structured_names` in key_measurements; if not
+# found there, falls back to `label_pattern` + `value_pattern` against the
+# finding's text. `applies_to_category` restricts which evidence_findings
+# rows the rule scans, so a rule for a monitoring reading doesn't misfire on
+# a paper Megger row using the same word.
 MEASUREMENT_RULES = [
     {
         "name": "insulation_resistance_live",
         "applies_to_category": "Inverter & Monitoring",
+        "structured_names": {"insulation_resistance_mohm"},
         "label_pattern": re.compile(
             r"insulation\s*resistance|ค่าฉนวน|ความต้านทานฉนวน|\briso\b",
             re.IGNORECASE,
@@ -595,16 +640,23 @@ def _extract_value(text: str, value_pattern):
     return value, sign
 
 
+def _reading_for_rule(finding: dict, rule: dict):
+    """Structured key_measurements first; text regex only as a fallback."""
+    value, sign = _structured_lookup(finding, rule["structured_names"])
+    if value is not None:
+        return value, sign
+    text = f"{finding.get('observed_data', '')} {finding.get('engineering_diagnosis', '')}"
+    if not rule["label_pattern"].search(text):
+        return None, None
+    return _extract_value(text, rule["value_pattern"])
+
+
 def _rule_severity(value: float, sign, thresholds):
-    if sign == ">":
-        # A ">1000" reading is a lower bound: the true value is at least this
-        # high, so it can only be unsafe if the bound itself is already
-        # below the tightest limit (rare, but don't silently ignore it).
-        pass
-    elif sign == "<":
-        # A "<X" reading is an upper bound: the true value could be far
-        # below X, so evaluate against X directly (conservative).
-        pass
+    # A ">1000" reading is a lower bound (true value is at least this high);
+    # a "<X" reading is an upper bound (true value could be far below X, so
+    # evaluate conservatively against X itself). Either way, comparing the
+    # captured number against the threshold table below is the correct,
+    # physically-honest check for both cases.
     for comparator, limit, severity in thresholds:
         if comparator == "<" and value < limit:
             return severity
@@ -626,13 +678,10 @@ def apply_measurement_thresholds(report: dict) -> tuple:
     for finding in findings:
         if not isinstance(finding, dict):
             continue
-        text = f"{finding.get('observed_data', '')} {finding.get('engineering_diagnosis', '')}"
         for rule in MEASUREMENT_RULES:
             if finding.get("category") != rule["applies_to_category"]:
                 continue
-            if not rule["label_pattern"].search(text):
-                continue
-            value, sign = _extract_value(text, rule["value_pattern"])
+            value, sign = _reading_for_rule(finding, rule)
             if value is None:
                 continue
             rule_severity = _rule_severity(value, sign, rule["thresholds"])
@@ -670,6 +719,7 @@ def apply_measurement_thresholds(report: dict) -> tuple:
 _INVERTER_RANGE = re.compile(r"inv[_-]?(\d+)\s*-\s*(\d+)", re.IGNORECASE)
 _INVERTER_SINGLE = re.compile(r"inv[_-]?(\d+)(?!\s*-)", re.IGNORECASE)
 _RISO_VALUE = re.compile(r"(>|<)?\s*([\d.]+)\s*(?:m\W?ohm|m\W?\u03a9)", re.IGNORECASE)
+_RISO_NAMES = {"insulation_resistance_mohm"}
 
 
 def _inverter_ids(source_file: str):
@@ -681,6 +731,14 @@ def _inverter_ids(source_file: str):
     if single_match:
         return [int(single_match.group(1))]
     return []
+
+
+def _riso_reading(finding: dict):
+    value, sign = _structured_lookup(finding, _RISO_NAMES)
+    if value is not None:
+        return value, sign
+    text = f"{finding.get('observed_data', '')} {finding.get('engineering_diagnosis', '')}"
+    return _extract_value(text, _RISO_VALUE)
 
 
 def detect_cross_source_conflicts(report: dict) -> dict:
@@ -698,8 +756,7 @@ def detect_cross_source_conflicts(report: dict) -> dict:
         if not isinstance(finding, dict):
             continue
         source_file = str(finding.get("source_file", ""))
-        text = f"{finding.get('observed_data', '')} {finding.get('engineering_diagnosis', '')}"
-        value, sign = _extract_value(text, _RISO_VALUE)
+        value, sign = _riso_reading(finding)
         if value is None:
             continue
         ids = _inverter_ids(source_file)
@@ -734,6 +791,7 @@ def detect_cross_source_conflicts(report: dict) -> dict:
                     "[กฎอัตโนมัติ: cross_source_conflict]"
                 ),
                 "severity": "WARNING",
+                "key_measurements": [],
             })
 
     if conflicts:
@@ -746,14 +804,26 @@ def detect_cross_source_conflicts(report: dict) -> dict:
 
 
 # --- Deterministic recovery for plant-level totals -----------------------
-# The LLM sometimes writes real per-inverter numbers in evidence_findings but
-# answers "UNCONFIRMED" for the plant-level total anyway (it has to sum 6+
-# separate readings correctly in the same pass as everything else). Summing
-# is a Python problem, not an LLM judgment call — do it deterministically
-# whenever the per-item numbers are actually present.
+# The LLM sometimes writes real per-inverter numbers but answers
+# "UNCONFIRMED" for the plant-level total anyway (it has to correctly sum 6+
+# separate readings in the same pass as everything else). Summing is a
+# Python problem, not an LLM judgment call — do it deterministically
+# whenever every per-item number is actually present. Only active_power_kw
+# is summed here — see the module docstring for why grid_current_a and
+# rated_capacity_kw are deliberately never auto-derived.
 
-_ACTIVE_POWER = re.compile(r"active\s*power[:\s]*([\d.]+)\s*kw", re.IGNORECASE)
+_ACTIVE_POWER_TEXT = re.compile(r"active\s*power[:\s]*([\d.]+)\s*kw", re.IGNORECASE)
+_ACTIVE_POWER_NAMES = {"active_power_kw"}
 _UNRESOLVED_VALUES = {None, "", "unconfirmed", "n/a", "null"}
+
+
+def _active_power_reading(finding: dict):
+    value, _ = _structured_lookup(finding, _ACTIVE_POWER_NAMES)
+    if value is not None:
+        return value
+    text = f"{finding.get('observed_data', '')} {finding.get('engineering_diagnosis', '')}"
+    match = _ACTIVE_POWER_TEXT.search(text)
+    return float(match.group(1)) if match else None
 
 
 def derive_plant_totals(report: dict) -> dict:
@@ -767,25 +837,351 @@ def derive_plant_totals(report: dict) -> dict:
     if not isinstance(findings, list):
         return report
 
-    per_inverter_kw = []
-    for finding in findings:
-        if not isinstance(finding, dict) or finding.get("category") != "Inverter & Monitoring":
-            continue
-        text = f"{finding.get('observed_data', '')} {finding.get('engineering_diagnosis', '')}"
-        match = _ACTIVE_POWER.search(text)
-        if match:
-            per_inverter_kw.append(float(match.group(1)))
+    inverter_findings = [f for f in findings if isinstance(f, dict) and f.get("category") == "Inverter & Monitoring"]
+    per_inverter_kw = [_active_power_reading(f) for f in inverter_findings]
 
     # Only fill in the total when every inverter reading is present — a
     # partial sum (e.g. 4 of 6 units) would silently understate output,
     # which is worse than honestly leaving it UNCONFIRMED.
-    inverter_findings = [f for f in findings if isinstance(f, dict) and f.get("category") == "Inverter & Monitoring"]
-    if per_inverter_kw and len(per_inverter_kw) == len(inverter_findings):
+    if per_inverter_kw and all(v is not None for v in per_inverter_kw):
         summary["active_power_kw"] = str(round(sum(per_inverter_kw), 3))
         report["plant_summary"] = summary
 
     return report
 
+PYEOF
+
+cat > core/evidence_validator.py << 'PYEOF'
+import re
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+
+
+Status = Literal["CRITICAL", "WARNING", "NORMAL"]
+Severity = Literal["CRITICAL", "WARNING", "NORMAL", "INFORMATIONAL"]
+Category = Literal[
+    "Inverter & Monitoring", "Field Alarms", "String Electrical", "Thermography", "Visual Survey"
+]
+
+
+def coerce_float(value) -> float | None:
+    """Strip unit text/commas from LLM output and cast to float. Missing/unparseable -> None
+    (unlike _coerce_cost, None here is meaningful: 'not measured' must stay distinguishable from 0)."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    cleaned = re.sub(r"[^\d.\-]", "", str(value))
+    try:
+        return float(cleaned) if cleaned not in ("", "-", ".") else None
+    except ValueError:
+        return None
+
+
+def _coerce_cost(value) -> float:
+    """Strip currency text/commas from LLM output and cast to float. Missing/unparseable -> 0.0."""
+    parsed = coerce_float(value)
+    return parsed if parsed is not None else 0.0
+
+
+class PlantSummary(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    plant_name: str | None = None
+    rated_capacity_kw: str | None = None
+    audit_date: str | None = None
+    overall_status: Status | None = None
+    active_power_kw: str | None = None
+    grid_current_a: str | None = None
+    # Numeric versions parsed once here so no other file needs its own regex to read these values.
+    rated_capacity_kw_num: float | None = None
+    active_power_kw_num: float | None = None
+    grid_current_a_num: float | None = None
+
+    @model_validator(mode="after")
+    def _parse_numeric_kpis(self):
+        self.rated_capacity_kw_num = coerce_float(self.rated_capacity_kw)
+        self.active_power_kw_num = coerce_float(self.active_power_kw)
+        self.grid_current_a_num = coerce_float(self.grid_current_a)
+        return self
+
+
+class Measurement(BaseModel):
+    """One numeric reading, captured as data instead of prose. The LLM's
+    narrative wording changes every run (sometimes 'Active power: 3.867 kW',
+    sometimes nothing at all); a structured field with a fixed vocabulary of
+    parameter names is what makes downstream Python code able to compute
+    totals/thresholds reliably instead of regexing whatever text showed up
+    this time. `comparator` preserves inequality readings honestly — a paper
+    Megger test reported as '>1000 MOhm' is a lower bound, not the number
+    1000, and collapsing that distinction would misrepresent the evidence."""
+    model_config = ConfigDict(extra="ignore")
+    parameter: str
+    value: float | None = None
+    unit: str | None = None
+    comparator: Literal["=", ">", "<"] = "="
+
+
+class EvidenceFinding(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    category: Category
+    source_file: str
+    observed_data: str
+    engineering_diagnosis: str
+    severity: Severity
+    key_measurements: list[Measurement] = Field(default_factory=list)
+
+
+class RootCause(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    issue: str
+    description: str
+    supporting_evidence: str
+
+
+class InactionDamageItem(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    identified_fault: str
+    component_at_risk: str
+    escalation_mechanism: str
+    min_damage_cost_thb: float = 0.0
+    max_damage_cost_thb: float = 0.0
+    min_prevention_cost_thb: float = 0.0
+    max_prevention_cost_thb: float = 0.0
+
+    @field_validator(
+        "min_damage_cost_thb", "max_damage_cost_thb",
+        "min_prevention_cost_thb", "max_prevention_cost_thb",
+        mode="before",
+    )
+    @classmethod
+    def _parse_cost(cls, value):
+        return _coerce_cost(value)
+
+    @model_validator(mode="after")
+    def _swap_if_inverted(self):
+        if self.max_damage_cost_thb < self.min_damage_cost_thb:
+            self.min_damage_cost_thb, self.max_damage_cost_thb = (
+                self.max_damage_cost_thb, self.min_damage_cost_thb,
+            )
+        if self.max_prevention_cost_thb < self.min_prevention_cost_thb:
+            self.min_prevention_cost_thb, self.max_prevention_cost_thb = (
+                self.max_prevention_cost_thb, self.min_prevention_cost_thb,
+            )
+        return self
+
+
+class CorrectiveAction(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    step_number: int = Field(ge=1)
+    title: str
+    actions: list[str]
+
+
+class SparePartTool(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    item_name: str
+    recommended_qty: str
+    purpose: str
+
+
+class MasterReport(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    plant_summary: PlantSummary
+    executive_summary: str
+    evidence_findings: list[EvidenceFinding]
+    root_causes: list[RootCause]
+    inaction_damage_matrix: list[InactionDamageItem] = Field(default_factory=list)
+    corrective_actions: list[CorrectiveAction]
+    spare_parts_tools: list[SparePartTool]
+
+
+def validate_report(data: dict) -> dict:
+    """Validate the master report and reject unsupported claims instead of inventing fallback text."""
+    try:
+        report = MasterReport.model_validate(data)
+    except ValidationError as error:
+        raise ValueError(f"Master report schema validation failed: {error}") from error
+
+    result = report.model_dump()
+    result["total_max_damage_exposure_thb"] = sum(
+        item["max_damage_cost_thb"] for item in result["inaction_damage_matrix"]
+    )
+    evidence_text = " ".join(
+        f"{finding.source_file} {finding.observed_data} {finding.engineering_diagnosis}"
+        for finding in report.evidence_findings
+    ).lower()
+    for cause in result["root_causes"]:
+        claim = f"{cause['issue']} {cause['description']}".lower()
+        proven_marker = any(marker in evidence_text for marker in ("alarm", "riso", "megger", "el test", "insulation"))
+        if any(term in claim for term in ("microcrack", "micro-crack", "ground fault", "riso low")) and not proven_marker:
+            cause["description"] = "UNCONFIRMED_HYPOTHESIS"
+            cause["supporting_evidence"] = "UNCONFIRMED"
+    return result
+
+PYEOF
+
+cat > engines/master_engine.py << 'PYEOF'
+import json
+from datetime import date
+
+from core.vision_client import execute_gemini_vision, optimize_image
+
+MASTER_ENGINE_PROMPT = """
+You are the STUDIO OM Solar O&M Engineering Synthesis Engine.
+Analyze only the current uploaded evidence and field notes. Historical/reference material is context, never current evidence.
+DO NOT invent numbers or default to template examples. Extract only visible numbers, labels, and text.
+If a value, diagnosis, cause, or action is not visible or proven, use null or "UNCONFIRMED".
+A root cause is proven only by explicit alarm text, measurement evidence, EL evidence, or insulation test evidence.
+Keep observed_data separate from engineering_diagnosis. Cross-correlate independent evidence sources.
+
+STRUCTURED MEASUREMENTS (in addition to, never instead of, the observed_data narrative):
+For every finding, also record every numeric reading you can see as a separate entry in "key_measurements".
+Use these exact parameter names whenever the reading matches one of them (use others only when none of these fit):
+active_power_kw, insulation_resistance_mohm, continuity_resistance_ohm, grid_frequency_hz, power_factor,
+internal_temp_c, daily_energy_kwh, total_yield_kwh, grid_voltage_v, string_current_a, grid_current_a.
+Give "value" as a bare number only (no unit text, no > or < symbol in the number itself).
+If the source reads as an inequality (e.g. "Riso +/G >1000 MOhm" or "<0.5 Ohm"), set "comparator" to ">" or "<"
+accordingly and "value" to that bound — do not silently turn ">1000" into an exact reading of 1000.
+Use "comparator": "=" for a directly read value. Never leave key_measurements empty when a number is visible
+in the evidence, even if that same number is also described in the observed_data text.
+
+CRITICAL INACTION DAMAGE ANALYSIS:
+For each major or critical issue found, analyze the consequential equipment damage that WILL OCCUR if neglected (e.g. Ground fault -> Inverter MPPT power board fire/short-circuit costing 80,000-150,000 THB vs 500-1,500 THB MC4 repair; Hotspot -> Cell delamination/shattered glass costing 4,500-9,000 THB module replacement vs 0-500 THB cleaning).
+Output damage and prevention costs as RAW NUMBERS ONLY (no commas, no currency symbols, no text) in min_damage_cost_thb, max_damage_cost_thb, min_prevention_cost_thb, max_prevention_cost_thb.
+
+If current evidence shows normal operation, 0 alarms, no hotspots, and normal measured currents, set overall_status strictly to NORMAL.
+For a normal operation result, set corrective_actions, spare_parts_tools, and inaction_damage_matrix to one entry stating: "ระบบทำงานสมบูรณ์ตามเกณฑ์มาตรฐาน ไม่พบความผิดปกติที่ต้องซ่อมแซมเร่งด่วน".
+If any LCD, meter screen, or thermal scale is blurry, dark, or cropped, state: "ภาพไม่ชัดเจน/ไม่สามารถอ่านค่าเชิงตัวเลขได้ แนะนำให้บันทึกภาพซ้ำหน้างาน".
+FIELD_NOTES.txt is optional; analyze visual and meter evidence when notes are absent.
+
+Return JSON only using exactly this schema:
+{
+  "plant_summary": {
+    "plant_name": "string",
+    "rated_capacity_kw": "string",
+    "audit_date": "string",
+    "overall_status": "CRITICAL|WARNING|NORMAL",
+    "active_power_kw": "string",
+    "grid_current_a": "string"
+  },
+  "executive_summary": "string",
+  "evidence_findings": [
+    {
+      "category": "Inverter & Monitoring|Field Alarms|String Electrical|Thermography|Visual Survey",
+      "source_file": "string",
+      "observed_data": "string",
+      "engineering_diagnosis": "string",
+      "severity": "CRITICAL|WARNING|NORMAL|INFORMATIONAL",
+      "key_measurements": [
+        {"parameter": "string (see fixed vocabulary above)", "value": 0, "unit": "string", "comparator": "=|>|<"}
+      ]
+    }
+  ],
+  "inaction_damage_matrix": [
+    {
+      "identified_fault": "string",
+      "component_at_risk": "string",
+      "escalation_mechanism": "string",
+      "min_damage_cost_thb": 0,
+      "max_damage_cost_thb": 0,
+      "min_prevention_cost_thb": 0,
+      "max_prevention_cost_thb": 0
+    }
+  ],
+  "root_causes": [
+    {
+      "issue": "string",
+      "description": "string",
+      "supporting_evidence": "string"
+    }
+  ],
+  "corrective_actions": [
+    {
+      "step_number": 1,
+      "title": "string",
+      "actions": ["string"]
+    }
+  ],
+  "spare_parts_tools": [
+    {
+      "item_name": "string",
+      "recommended_qty": "string",
+      "purpose": "string"
+    }
+  ]
+}
+"""
+
+LANGUAGE_INSTRUCTIONS = {
+    "th": "Write all narrative fields and analysis in professional engineering Thai. Keep standard technical terms (Inverter, String, Active Power, Megger Test, MC4, Hotspot) where appropriate.",
+    "en": "Write all narrative fields and analysis in professional technical English. Keep equipment names and measurement units exactly as observed.",
+}
+
+
+def file_parts(uploaded_files):
+    parts = []
+    for file in uploaded_files:
+        name = str(getattr(file, "name", "unknown"))
+        lower = name.lower()
+        if lower.endswith(".txt"):
+            content = file.read().decode("utf-8", errors="ignore")
+            file.seek(0)
+            parts.append({"text": f"FIELD NOTES {name}:\n{content[:8000]}"})
+        elif lower.endswith((".png", ".jpg", ".jpeg", ".webp")):
+            encoded = optimize_image(file.read(), max_dim=2400)
+            file.seek(0)
+            parts.append({"text": f"CURRENT EVIDENCE IMAGE: {name}"})
+            parts.append({"inline_data": {"mime_type": "image/png", "data": encoded}})
+        elif lower.endswith(".pdf"):
+            try:
+                from pypdf import PdfReader
+                reader = PdfReader(file)
+                pdf_text = "\n".join([page.extract_text() or "" for page in reader.pages[:10]])
+                file.seek(0)
+                parts.append({"text": f"REFERENCE DOCUMENT CONTENT ({name}):\n{pdf_text[:8000]}"})
+            except Exception:
+                file.seek(0)
+                parts.append({"text": f"REFERENCE DOCUMENT: {name}"})
+    return parts
+
+
+_file_parts = file_parts  # kept for internal call sites within this module
+
+
+def _parse_json_response(value):
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str):
+        raise RuntimeError("Master engine returned an invalid JSON response")
+    text = value.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1] if "\n" in text else text
+        text = text.rsplit("```", 1)[0].strip()
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("Master engine returned malformed JSON") from error
+    if not isinstance(parsed, dict):
+        raise RuntimeError("Master engine JSON response must be an object")
+    return parsed
+
+
+def run_master_analysis(uploaded_files, api_key: str, site_context: str = "", knowledge_context: str = "", lang: str = "th", plant_name: str | None = None) -> dict:
+    lang = lang if lang in LANGUAGE_INSTRUCTIONS else "th"
+    context = (
+        "CURRENT EVIDENCE ONLY.\n"
+        f"{LANGUAGE_INSTRUCTIONS[lang]}\n"
+        f"User-supplied plant name (metadata only): {plant_name or 'UNCONFIRMED'}\n"
+        f"Historical site context (not evidence): {site_context}\n"
+        f"Reference context (not evidence): {knowledge_context}\n"
+        f"Audit date: {date.today().isoformat()}"
+    )
+    result = execute_gemini_vision(
+        [{"text": f"{MASTER_ENGINE_PROMPT}\n{context}"}, *_file_parts(uploaded_files)],
+        api_key,
+    )
+    return _parse_json_response(result)
 PYEOF
 
 cat > tests/test_threshold_rules.py << 'PYEOF'
@@ -920,6 +1316,105 @@ def test_thai_label_ka_chanuan_is_also_caught_not_just_english_wording():
     assert report["evidence_findings"][0]["severity"] == "WARNING"
 
 
+# --- Structured key_measurements (primary path, added after the schema change) --
+
+def test_structured_insulation_reading_is_used_even_with_no_matching_text():
+    """The whole point of key_measurements: this must work even when the
+    model's prose doesn't mention 'insulation resistance' or 'ค่าฉนวน' at
+    all — exactly the run where the old text-only regex came up empty."""
+    report = _report([
+        {
+            "category": "Inverter & Monitoring", "source_file": "Inv_2.jpg",
+            "observed_data": "หน้าจอแสดงค่าปกติทั่วไป", "engineering_diagnosis": "",
+            "severity": "NORMAL",
+            "key_measurements": [{"parameter": "insulation_resistance_mohm", "value": 0.836, "unit": "MOhm", "comparator": "="}],
+        },
+    ])
+    report, locked = apply_measurement_thresholds(report)
+    assert report["evidence_findings"][0]["severity"] == "WARNING"
+
+
+def test_structured_reading_takes_priority_over_conflicting_text():
+    # If both are present, the structured number wins — it's the field the
+    # prompt now requires to be accurate, text is free-form and can drift.
+    report = _report([
+        {
+            "category": "Inverter & Monitoring", "source_file": "Inv_2.jpg",
+            "observed_data": "Insulation resistance: 20 MOhm (พิมพ์ผิดในข้อความ)",
+            "engineering_diagnosis": "", "severity": "NORMAL",
+            "key_measurements": [{"parameter": "insulation_resistance_mohm", "value": 0.3, "unit": "MOhm", "comparator": "="}],
+        },
+    ])
+    report, locked = apply_measurement_thresholds(report)
+    assert report["evidence_findings"][0]["severity"] == "CRITICAL"
+
+
+def test_comparator_greater_than_in_structured_data_is_not_flagged():
+    # A Megger '>1000 MOhm' reading structured as value=1000, comparator='>'
+    # must not be misread as an exact 1000 that somehow trips a < threshold.
+    report = _report([
+        {
+            "category": "Inverter & Monitoring", "source_file": "Inv_1.jpg",
+            "observed_data": "", "engineering_diagnosis": "", "severity": "NORMAL",
+            "key_measurements": [{"parameter": "insulation_resistance_mohm", "value": 1000, "unit": "MOhm", "comparator": ">"}],
+        },
+    ])
+    report, locked = apply_measurement_thresholds(report)
+    assert report["evidence_findings"][0]["severity"] == "NORMAL"
+
+
+def test_active_power_summed_from_structured_data_across_all_inverters():
+    report = {
+        "plant_summary": {"overall_status": "WARNING", "active_power_kw": "UNCONFIRMED"},
+        "evidence_findings": [
+            {"category": "Inverter & Monitoring", "source_file": "Inv_1.jpg", "observed_data": "", "engineering_diagnosis": "", "severity": "NORMAL",
+             "key_measurements": [{"parameter": "active_power_kw", "value": 1.067, "comparator": "="}]},
+            {"category": "Inverter & Monitoring", "source_file": "Inv_2.jpg", "observed_data": "", "engineering_diagnosis": "", "severity": "WARNING",
+             "key_measurements": [{"parameter": "active_power_kw", "value": 3.867, "comparator": "="}]},
+        ],
+    }
+    report = derive_plant_totals(report)
+    assert report["plant_summary"]["active_power_kw"] == "4.934"
+
+
+def test_structured_and_text_active_power_can_mix_across_findings():
+    # One finding has structured data, another only has it in prose — the
+    # fallback still lets the sum go through instead of giving up entirely.
+    report = {
+        "plant_summary": {"overall_status": "NORMAL", "active_power_kw": None},
+        "evidence_findings": [
+            {"category": "Inverter & Monitoring", "source_file": "Inv_1.jpg", "observed_data": "", "engineering_diagnosis": "", "severity": "NORMAL",
+             "key_measurements": [{"parameter": "active_power_kw", "value": 1.067, "comparator": "="}]},
+            {"category": "Inverter & Monitoring", "source_file": "Inv_2.jpg", "observed_data": "Active power: 3.867 kW", "engineering_diagnosis": "", "severity": "NORMAL",
+             "key_measurements": []},
+        ],
+    }
+    report = derive_plant_totals(report)
+    assert report["plant_summary"]["active_power_kw"] == "4.934"
+
+
+def test_grid_current_and_rated_capacity_are_never_touched_by_this_module():
+    """Physics/engineering guardrail: this module must never invent a plant-
+    level grid_current_a or rated_capacity_kw, even when it could technically
+    sum something — per-inverter currents aren't safely additive without
+    known circuit topology, and rated capacity isn't derivable from photos
+    at all. Only active_power_kw gets an automatic total."""
+    report = {
+        "plant_summary": {"overall_status": "NORMAL", "active_power_kw": "UNCONFIRMED", "grid_current_a": "UNCONFIRMED", "rated_capacity_kw": "UNCONFIRMED"},
+        "evidence_findings": [
+            {"category": "Inverter & Monitoring", "source_file": "Inv_1.jpg", "observed_data": "", "engineering_diagnosis": "", "severity": "NORMAL",
+             "key_measurements": [
+                 {"parameter": "active_power_kw", "value": 1.067, "comparator": "="},
+                 {"parameter": "grid_current_a", "value": 5.6, "comparator": "="},
+             ]},
+        ],
+    }
+    report = derive_plant_totals(report)
+    assert report["plant_summary"]["active_power_kw"] == "1.067"
+    assert report["plant_summary"]["grid_current_a"] == "UNCONFIRMED"
+    assert report["plant_summary"]["rated_capacity_kw"] == "UNCONFIRMED"
+
+
 # --- Deterministic recovery of plant-level totals ------------------------
 
 def test_unconfirmed_active_power_is_summed_from_per_inverter_readings():
@@ -1029,5 +1524,5 @@ def test_real_unnegated_ground_fault_still_locks_critical():
 PYEOF
 
 git add .
-git commit -m "fix: sum active_power_kw from per-inverter readings when Gemini leaves plant total UNCONFIRMED"
+git commit -m "feat: structured key_measurements as primary data source; sum active_power_kw safely; never auto-derive grid_current_a/rated_capacity_kw"
 git push
