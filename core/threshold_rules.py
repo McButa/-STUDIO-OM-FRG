@@ -210,3 +210,46 @@ def detect_cross_source_conflicts(report: dict) -> dict:
         report["plant_summary"] = summary
 
     return report
+
+
+# --- Deterministic recovery for plant-level totals -----------------------
+# The LLM sometimes writes real per-inverter numbers in evidence_findings but
+# answers "UNCONFIRMED" for the plant-level total anyway (it has to sum 6+
+# separate readings correctly in the same pass as everything else). Summing
+# is a Python problem, not an LLM judgment call — do it deterministically
+# whenever the per-item numbers are actually present.
+
+_ACTIVE_POWER = re.compile(r"active\s*power[:\s]*([\d.]+)\s*kw", re.IGNORECASE)
+_UNRESOLVED_VALUES = {None, "", "unconfirmed", "n/a", "null"}
+
+
+def derive_plant_totals(report: dict) -> dict:
+    summary = report.get("plant_summary", {})
+    current = summary.get("active_power_kw")
+    current_str = str(current).strip().lower() if current is not None else ""
+    if current_str not in _UNRESOLVED_VALUES:
+        return report  # Gemini already gave a usable number — don't second-guess it
+
+    findings = report.get("evidence_findings", [])
+    if not isinstance(findings, list):
+        return report
+
+    per_inverter_kw = []
+    for finding in findings:
+        if not isinstance(finding, dict) or finding.get("category") != "Inverter & Monitoring":
+            continue
+        text = f"{finding.get('observed_data', '')} {finding.get('engineering_diagnosis', '')}"
+        match = _ACTIVE_POWER.search(text)
+        if match:
+            per_inverter_kw.append(float(match.group(1)))
+
+    # Only fill in the total when every inverter reading is present — a
+    # partial sum (e.g. 4 of 6 units) would silently understate output,
+    # which is worse than honestly leaving it UNCONFIRMED.
+    inverter_findings = [f for f in findings if isinstance(f, dict) and f.get("category") == "Inverter & Monitoring"]
+    if per_inverter_kw and len(per_inverter_kw) == len(inverter_findings):
+        summary["active_power_kw"] = str(round(sum(per_inverter_kw), 3))
+        report["plant_summary"] = summary
+
+    return report
+

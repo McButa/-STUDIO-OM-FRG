@@ -6,7 +6,7 @@ from core.docx_generator import build_docx
 from core.evidence_validator import coerce_float, validate_report
 from core.job_manifest import build_manifest, manifest_summary
 from core.reference_reader import extract_reference_context
-from core.threshold_rules import apply_measurement_thresholds, detect_cross_source_conflicts
+from core.threshold_rules import apply_measurement_thresholds, derive_plant_totals, detect_cross_source_conflicts
 from database.db_manager import get_plant_history_context, get_previous_audit_kpis, get_similar_cases_context
 from engines.master_engine import run_master_analysis
 from engines.verification_engine import run_critical_verification
@@ -41,6 +41,31 @@ def _plant_name(manifest):
     return next(iter(sites), "Unknown Site") if len(sites) == 1 else "Unknown Site"
 
 
+NEGATION_MARKERS = (
+    "ไม่พบ", "ไม่มี", "ไม่เกิด", "ไม่ปรากฏ", "ปราศจาก",
+    "no ", "not ", "without", "free of", "no evidence of",
+)
+
+
+def _keyword_present_unnegated(text: str, keyword: str, window: int = 30) -> bool:
+    """True if `keyword` appears in `text` (case-insensitive) at least once
+    WITHOUT a negation word in the `window` characters right before it.
+    Guards against text like 'ไม่พบภาวะกราวด์ฟอลต์ (Ground Fault)' — literally
+    'no ground fault found' — being read as a positive hit on 'ground fault'
+    just because the phrase appears somewhere in the sentence."""
+    text_lower = text.lower()
+    keyword_lower = keyword.lower()
+    start = 0
+    while True:
+        idx = text_lower.find(keyword_lower, start)
+        if idx == -1:
+            return False
+        preceding = text_lower[max(0, idx - window):idx]
+        if not any(neg in preceding for neg in NEGATION_MARKERS):
+            return True
+        start = idx + len(keyword_lower)
+
+
 def _enforce_engineering_rules(report: dict) -> tuple:
     summary = report.get("plant_summary", {})
     p_act = coerce_float(summary.get("active_power_kw")) or 0.0
@@ -58,7 +83,10 @@ def _enforce_engineering_rules(report: dict) -> tuple:
         summary["overall_status"] = "CRITICAL"
         hard_locked = True
     # Rule 2: Active Ground Fault / Short Circuit / Major Alarms -> Lock to CRITICAL
-    elif any(k in findings_text for k in ["ground fault", "short circuit", "insulation fault", "major alarm", "ลัดวงจรลงดิน", "รั่วลงดิน"]):
+    elif any(
+        _keyword_present_unnegated(findings_text, k)
+        for k in ["ground fault", "short circuit", "insulation fault", "major alarm", "ลัดวงจรลงดิน", "รั่วลงดิน"]
+    ):
         summary["overall_status"] = "CRITICAL"
         hard_locked = True
     # Rule 3: Confirmed normal operation with 0 alarms
@@ -109,6 +137,7 @@ def process_field_report(uploaded_files, api_key: str, plant_name: str = "", lan
     reference_context, references = extract_reference_context(uploaded_files)
     knowledge_context = get_similar_cases_context([context_plant], report_type, context_plant)
     report = run_master_analysis(uploaded_files, api_key, site_context, knowledge_context + reference_context, lang=lang, plant_name=context_plant or None)
+    report = derive_plant_totals(report)
     report, status_hard_locked = _enforce_engineering_rules(report)
     report, measurement_locked = apply_measurement_thresholds(report)
     report = detect_cross_source_conflicts(report)

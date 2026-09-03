@@ -355,7 +355,8 @@ with tab_knowledge:
                 st.write(f"• **วิธีแก้ไขมาตรฐาน:** {inc['verified_solution']}")
                 st.write(f"• **อะไหล่ที่ใช้:** {inc['parts_used']}")
 
-    conn.close()PYEOF
+    conn.close()
+PYEOF
 
 cat > router.py << 'PYEOF'
 import hashlib
@@ -526,7 +527,8 @@ def process_field_report(uploaded_files, api_key: str, plant_name: str = "", lan
     report["plant_summary"]["plant_name"] = selected_plant
     report["language"] = lang if lang in {"th", "en"} else "th"
     document = build_docx(report, uploaded_files)
-    return report, document, report_type, site_contextPYEOF
+    return report, document, report_type, site_context
+PYEOF
 
 cat > core/threshold_rules.py << 'PYEOF'
 """
@@ -783,6 +785,7 @@ def derive_plant_totals(report: dict) -> dict:
         report["plant_summary"] = summary
 
     return report
+
 PYEOF
 
 cat > tests/test_threshold_rules.py << 'PYEOF'
@@ -1022,6 +1025,7 @@ def test_real_unnegated_ground_fault_still_locks_critical():
     report, locked = _enforce_engineering_rules(report)
     assert report["plant_summary"]["overall_status"] == "CRITICAL"
     assert locked is True
+
 PYEOF
 
 git add .

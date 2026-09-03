@@ -234,3 +234,4 @@ def test_real_unnegated_ground_fault_still_locks_critical():
     report, locked = _enforce_engineering_rules(report)
     assert report["plant_summary"]["overall_status"] == "CRITICAL"
     assert locked is True
+
