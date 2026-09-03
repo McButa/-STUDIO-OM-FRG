@@ -6,11 +6,12 @@ from core.docx_generator import build_docx
 from core.evidence_validator import coerce_float, validate_report
 from core.job_manifest import build_manifest, manifest_summary
 from core.reference_reader import extract_reference_context
+from core.threshold_rules import apply_measurement_thresholds, detect_cross_source_conflicts
 from database.db_manager import get_plant_history_context, get_previous_audit_kpis, get_similar_cases_context
 from engines.master_engine import run_master_analysis
 from engines.verification_engine import run_critical_verification
 
-PROMPT_VERSION = "2026-08-29-master-v3-verification"
+PROMPT_VERSION = "2026-09-03-master-v4-threshold-rules"
 REPORT_SCHEMA_VERSION = "2.1"
 
 
@@ -109,6 +110,9 @@ def process_field_report(uploaded_files, api_key: str, plant_name: str = "", lan
     knowledge_context = get_similar_cases_context([context_plant], report_type, context_plant)
     report = run_master_analysis(uploaded_files, api_key, site_context, knowledge_context + reference_context, lang=lang, plant_name=context_plant or None)
     report, status_hard_locked = _enforce_engineering_rules(report)
+    report, measurement_locked = apply_measurement_thresholds(report)
+    report = detect_cross_source_conflicts(report)
+    status_hard_locked = status_hard_locked or measurement_locked
     report = validate_report(report)
     if report.get("plant_summary", {}).get("overall_status") == "CRITICAL" and not status_hard_locked:
         report = run_critical_verification(uploaded_files, report, api_key)
