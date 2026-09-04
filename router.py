@@ -6,7 +6,7 @@ from core.docx_generator import build_docx
 from core.evidence_validator import coerce_float, validate_report
 from core.job_manifest import build_manifest, manifest_summary
 from core.reference_reader import extract_reference_context
-from core.threshold_rules import apply_measurement_thresholds, apply_peer_comparison, derive_plant_totals, detect_cross_source_conflicts
+from core.threshold_rules import apply_measurement_thresholds, apply_peer_comparison, derive_plant_totals, detect_cross_source_conflicts, reconcile_narrative_with_findings
 from database.db_manager import get_plant_history_context, get_previous_audit_kpis, get_similar_cases_context
 from engines.master_engine import run_master_analysis
 from engines.verification_engine import run_critical_verification
@@ -151,6 +151,7 @@ def process_field_report(uploaded_files, api_key: str, plant_name: str = "", lan
     report, measurement_locked = apply_measurement_thresholds(report)
     report = apply_peer_comparison(report)
     report = detect_cross_source_conflicts(report)
+    report = reconcile_narrative_with_findings(report)
     status_hard_locked = status_hard_locked or measurement_locked
     report = validate_report(report)
     if report.get("plant_summary", {}).get("overall_status") == "CRITICAL" and not status_hard_locked:

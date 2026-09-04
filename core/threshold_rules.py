@@ -56,6 +56,40 @@ def _higher(a: str, b: str) -> str:
     return a if SEVERITY_RANK.get(a, 0) >= SEVERITY_RANK.get(b, 0) else b
 
 
+# --- Shared: which single inverter (if any) does this piece of evidence
+# represent? A live monitoring dashboard screenshot names exactly one unit
+# ("Inv_2.jpg"). A batch test sheet covering several units at once names a
+# range ("DC_Inv_1-2.jpg", "AC_Inv_1-6.jpg") — that's a different kind of
+# evidence (one aggregate test result, not one unit's live reading), even
+# when the LLM happens to file both under the same category. Functions that
+# need "one specific unit's own reading" (peer comparison, summing
+# per-inverter totals) must use `_single_inverter_id`, not just filter by
+# category, or a batch test's number silently gets treated as if it came
+# from a single live unit.
+_INVERTER_RANGE = re.compile(r"inv[_-]?(\d+)\s*-\s*(\d+)", re.IGNORECASE)
+_INVERTER_SINGLE = re.compile(r"inv[_-]?(\d+)(?!\s*-)", re.IGNORECASE)
+
+
+def _inverter_ids(source_file: str):
+    range_match = _INVERTER_RANGE.search(source_file)
+    if range_match:
+        start, end = int(range_match.group(1)), int(range_match.group(2))
+        return list(range(start, end + 1))
+    single_match = _INVERTER_SINGLE.search(source_file)
+    if single_match:
+        return [int(single_match.group(1))]
+    return []
+
+
+def _single_inverter_id(source_file: str):
+    """Returns the inverter id only when the filename names exactly ONE
+    unit; returns None for a batch/range file (or no id at all) — the
+    caller should then treat this finding as not representing a single
+    unit's own live reading."""
+    ids = _inverter_ids(source_file)
+    return ids[0] if len(ids) == 1 else None
+
+
 def _structured_lookup(finding: dict, parameter_names: set):
     """Look up a numeric reading from the finding's structured
     key_measurements list. Returns (value, comparator) or (None, None)."""
@@ -213,9 +247,23 @@ def apply_peer_comparison(report: dict) -> dict:
         ]
         readings = []
         for idx, finding in enumerate(category_findings):
-            value, _sign = _reading_for_rule(finding, rule)
-            if value is not None:
-                readings.append({"id": idx, "value": value, "finding": finding})
+            if _single_inverter_id(str(finding.get("source_file", ""))) is None:
+                # Not a single unit's own reading (either a multi-unit batch
+                # test file, or no inverter id in the filename at all) — not
+                # a valid peer for comparing individual units against each
+                # other.
+                continue
+            value, sign = _reading_for_rule(finding, rule)
+            if value is None:
+                continue
+            if sign not in ("=", None):
+                # An inequality reading (">500", "<0.5") is a compliance bound
+                # from a different measurement method (e.g. a Megger-style
+                # test), not a directly comparable live reading. Kept as a
+                # second guard even with the single-unit-id filter above,
+                # since a mislabeled single-id file could still carry one.
+                continue
+            readings.append({"id": idx, "value": value, "finding": finding})
 
         peer_results = compare_to_peers(
             [{"id": r["id"], "value": r["value"]} for r in readings],
@@ -251,21 +299,8 @@ def apply_peer_comparison(report: dict) -> dict:
 # Not a single-number threshold, so it earns its own function rather than a
 # MEASUREMENT_RULES entry — but it's still fully deterministic (no LLM call).
 
-_INVERTER_RANGE = re.compile(r"inv[_-]?(\d+)\s*-\s*(\d+)", re.IGNORECASE)
-_INVERTER_SINGLE = re.compile(r"inv[_-]?(\d+)(?!\s*-)", re.IGNORECASE)
 _RISO_VALUE = re.compile(r"(>|<)?\s*([\d.]+)\s*(?:m\W?ohm|m\W?\u03a9)", re.IGNORECASE)
 _RISO_NAMES = {"insulation_resistance_mohm"}
-
-
-def _inverter_ids(source_file: str):
-    range_match = _INVERTER_RANGE.search(source_file)
-    if range_match:
-        start, end = int(range_match.group(1)), int(range_match.group(2))
-        return list(range(start, end + 1))
-    single_match = _INVERTER_SINGLE.search(source_file)
-    if single_match:
-        return [int(single_match.group(1))]
-    return []
 
 
 def _riso_reading(finding: dict):
@@ -372,7 +407,11 @@ def derive_plant_totals(report: dict) -> dict:
     if not isinstance(findings, list):
         return report
 
-    inverter_findings = [f for f in findings if isinstance(f, dict) and f.get("category") == "Inverter & Monitoring"]
+    inverter_findings = [
+        f for f in findings
+        if isinstance(f, dict) and f.get("category") == "Inverter & Monitoring"
+        and _single_inverter_id(str(f.get("source_file", ""))) is not None
+    ]
     per_inverter_kw = [_active_power_reading(f) for f in inverter_findings]
 
     # Only fill in the total when every inverter reading is present — a
@@ -381,6 +420,90 @@ def derive_plant_totals(report: dict) -> dict:
     if per_inverter_kw and all(v is not None for v in per_inverter_kw):
         summary["active_power_kw"] = str(round(sum(per_inverter_kw), 3))
         report["plant_summary"] = summary
+
+    return report
+
+
+# --- Narrative/data consistency guard -------------------------------------
+# apply_measurement_thresholds, apply_peer_comparison, and
+# detect_cross_source_conflicts only ever touch evidence_findings and
+# plant_summary. But executive_summary, root_causes, and corrective_actions
+# are written by the LLM in the SAME call as evidence_findings, based on
+# ITS OWN (pre-escalation) judgment — if the LLM decided everything was
+# NORMAL, those sections say so in full prose, and nothing above ever goes
+# back to update them once a rule forces a finding to WARNING/CRITICAL
+# afterward. The result: a report whose header says WARNING while the
+# executive summary confidently says "no abnormality found," and whose root
+# causes / corrective actions sections are empty or generic "all clear" —
+# which is precisely the kind of internally-contradictory, untrustworthy
+# report this whole effort exists to prevent.
+#
+# This function does NOT try to fabricate the missing engineering analysis
+# itself (writing a plausible-sounding root cause/corrective action without
+# being sure it's right would just be a different flavor of the same
+# problem). It only guarantees the report can never claim "all clear" while
+# escalated findings exist elsewhere in it — by adding an unmissable,
+# factual pointer back to the findings that a human still needs to act on.
+
+def reconcile_narrative_with_findings(report: dict) -> dict:
+    findings = report.get("evidence_findings", [])
+    if not isinstance(findings, list):
+        return report
+
+    escalated = [
+        f for f in findings
+        if isinstance(f, dict) and f.get("severity") in ("WARNING", "CRITICAL")
+    ]
+    if not escalated:
+        return report
+
+    escalated_files = ", ".join(sorted({str(f.get("source_file", "")) for f in escalated}))
+    banner = (
+        f"[หมายเหตุจากระบบตรวจสอบอัตโนมัติ: มี {len(escalated)} รายการที่ถูกยกระดับเป็น WARNING/CRITICAL "
+        f"โดยกฎวิศวกรรมอัตโนมัติ ({escalated_files}) กรุณาอ่านหัวข้อผลการตรวจสอบ (ข้อ 3) โดยละเอียด "
+        "ก่อนสรุปว่าระบบไม่มีความผิดปกติ — บทสรุปด้านล่างนี้อาจเขียนขึ้นก่อนการยกระดับดังกล่าว]\n\n"
+    )
+    summary_text = report.get("executive_summary", "") or ""
+    if "หมายเหตุจากระบบตรวจสอบอัตโนมัติ" not in summary_text:
+        report["executive_summary"] = banner + summary_text
+
+    root_causes = report.get("root_causes", [])
+    if not isinstance(root_causes, list):
+        root_causes = []
+    covered_files = {str(rc.get("supporting_evidence", "")) for rc in root_causes if isinstance(rc, dict)}
+    for f in escalated:
+        source_file = str(f.get("source_file", ""))
+        if any(source_file in c for c in covered_files):
+            continue
+        root_causes.append({
+            "issue": f"{f.get('category', '')} — {source_file} (severity: {f.get('severity')})",
+            "description": (
+                f.get("engineering_diagnosis", "")
+                or "ยกระดับโดยกฎวิศวกรรมอัตโนมัติ ยังไม่มีคำอธิบายเชิงวิเคราะห์จาก AI ระบุไว้ในรอบนี้ "
+                   "ต้องตรวจสอบข้อมูลในหัวข้อผลการตรวจสอบเพิ่มเติมก่อนสรุปสาเหตุ"
+            ),
+            "supporting_evidence": source_file,
+        })
+    report["root_causes"] = root_causes
+
+    corrective_actions = report.get("corrective_actions", [])
+    if not isinstance(corrective_actions, list):
+        corrective_actions = []
+    has_followup_action = any(
+        isinstance(a, dict) and any(f.get("source_file", "") in " ".join(a.get("actions", [])) for f in escalated)
+        for a in corrective_actions
+    )
+    if not has_followup_action:
+        next_step_number = max([a.get("step_number", 0) for a in corrective_actions if isinstance(a, dict)], default=0) + 1
+        corrective_actions.append({
+            "step_number": next_step_number,
+            "title": "ตรวจสอบซ้ำหน้างานสำหรับรายการที่ถูกยกระดับโดยระบบอัตโนมัติ",
+            "actions": [
+                f"ตรวจสอบซ้ำหน้างาน: {escalated_files}",
+                "ยืนยันสาเหตุและความรุนแรงจริงก่อนวางแผนซ่อมบำรุงหรือปิดเคส",
+            ],
+        })
+    report["corrective_actions"] = corrective_actions
 
     return report
 

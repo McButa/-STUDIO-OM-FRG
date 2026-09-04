@@ -367,7 +367,7 @@ from core.docx_generator import build_docx
 from core.evidence_validator import coerce_float, validate_report
 from core.job_manifest import build_manifest, manifest_summary
 from core.reference_reader import extract_reference_context
-from core.threshold_rules import apply_measurement_thresholds, apply_peer_comparison, derive_plant_totals, detect_cross_source_conflicts
+from core.threshold_rules import apply_measurement_thresholds, apply_peer_comparison, derive_plant_totals, detect_cross_source_conflicts, reconcile_narrative_with_findings
 from database.db_manager import get_plant_history_context, get_previous_audit_kpis, get_similar_cases_context
 from engines.master_engine import run_master_analysis
 from engines.verification_engine import run_critical_verification
@@ -512,6 +512,7 @@ def process_field_report(uploaded_files, api_key: str, plant_name: str = "", lan
     report, measurement_locked = apply_measurement_thresholds(report)
     report = apply_peer_comparison(report)
     report = detect_cross_source_conflicts(report)
+    report = reconcile_narrative_with_findings(report)
     status_hard_locked = status_hard_locked or measurement_locked
     report = validate_report(report)
     if report.get("plant_summary", {}).get("overall_status") == "CRITICAL" and not status_hard_locked:
@@ -597,6 +598,40 @@ SEVERITY_RANK = {"NORMAL": 0, "INFORMATIONAL": 0, "WARNING": 1, "CRITICAL": 2}
 
 def _higher(a: str, b: str) -> str:
     return a if SEVERITY_RANK.get(a, 0) >= SEVERITY_RANK.get(b, 0) else b
+
+
+# --- Shared: which single inverter (if any) does this piece of evidence
+# represent? A live monitoring dashboard screenshot names exactly one unit
+# ("Inv_2.jpg"). A batch test sheet covering several units at once names a
+# range ("DC_Inv_1-2.jpg", "AC_Inv_1-6.jpg") — that's a different kind of
+# evidence (one aggregate test result, not one unit's live reading), even
+# when the LLM happens to file both under the same category. Functions that
+# need "one specific unit's own reading" (peer comparison, summing
+# per-inverter totals) must use `_single_inverter_id`, not just filter by
+# category, or a batch test's number silently gets treated as if it came
+# from a single live unit.
+_INVERTER_RANGE = re.compile(r"inv[_-]?(\d+)\s*-\s*(\d+)", re.IGNORECASE)
+_INVERTER_SINGLE = re.compile(r"inv[_-]?(\d+)(?!\s*-)", re.IGNORECASE)
+
+
+def _inverter_ids(source_file: str):
+    range_match = _INVERTER_RANGE.search(source_file)
+    if range_match:
+        start, end = int(range_match.group(1)), int(range_match.group(2))
+        return list(range(start, end + 1))
+    single_match = _INVERTER_SINGLE.search(source_file)
+    if single_match:
+        return [int(single_match.group(1))]
+    return []
+
+
+def _single_inverter_id(source_file: str):
+    """Returns the inverter id only when the filename names exactly ONE
+    unit; returns None for a batch/range file (or no id at all) — the
+    caller should then treat this finding as not representing a single
+    unit's own live reading."""
+    ids = _inverter_ids(source_file)
+    return ids[0] if len(ids) == 1 else None
 
 
 def _structured_lookup(finding: dict, parameter_names: set):
@@ -756,9 +791,23 @@ def apply_peer_comparison(report: dict) -> dict:
         ]
         readings = []
         for idx, finding in enumerate(category_findings):
-            value, _sign = _reading_for_rule(finding, rule)
-            if value is not None:
-                readings.append({"id": idx, "value": value, "finding": finding})
+            if _single_inverter_id(str(finding.get("source_file", ""))) is None:
+                # Not a single unit's own reading (either a multi-unit batch
+                # test file, or no inverter id in the filename at all) — not
+                # a valid peer for comparing individual units against each
+                # other.
+                continue
+            value, sign = _reading_for_rule(finding, rule)
+            if value is None:
+                continue
+            if sign not in ("=", None):
+                # An inequality reading (">500", "<0.5") is a compliance bound
+                # from a different measurement method (e.g. a Megger-style
+                # test), not a directly comparable live reading. Kept as a
+                # second guard even with the single-unit-id filter above,
+                # since a mislabeled single-id file could still carry one.
+                continue
+            readings.append({"id": idx, "value": value, "finding": finding})
 
         peer_results = compare_to_peers(
             [{"id": r["id"], "value": r["value"]} for r in readings],
@@ -794,21 +843,8 @@ def apply_peer_comparison(report: dict) -> dict:
 # Not a single-number threshold, so it earns its own function rather than a
 # MEASUREMENT_RULES entry — but it's still fully deterministic (no LLM call).
 
-_INVERTER_RANGE = re.compile(r"inv[_-]?(\d+)\s*-\s*(\d+)", re.IGNORECASE)
-_INVERTER_SINGLE = re.compile(r"inv[_-]?(\d+)(?!\s*-)", re.IGNORECASE)
 _RISO_VALUE = re.compile(r"(>|<)?\s*([\d.]+)\s*(?:m\W?ohm|m\W?\u03a9)", re.IGNORECASE)
 _RISO_NAMES = {"insulation_resistance_mohm"}
-
-
-def _inverter_ids(source_file: str):
-    range_match = _INVERTER_RANGE.search(source_file)
-    if range_match:
-        start, end = int(range_match.group(1)), int(range_match.group(2))
-        return list(range(start, end + 1))
-    single_match = _INVERTER_SINGLE.search(source_file)
-    if single_match:
-        return [int(single_match.group(1))]
-    return []
 
 
 def _riso_reading(finding: dict):
@@ -915,7 +951,11 @@ def derive_plant_totals(report: dict) -> dict:
     if not isinstance(findings, list):
         return report
 
-    inverter_findings = [f for f in findings if isinstance(f, dict) and f.get("category") == "Inverter & Monitoring"]
+    inverter_findings = [
+        f for f in findings
+        if isinstance(f, dict) and f.get("category") == "Inverter & Monitoring"
+        and _single_inverter_id(str(f.get("source_file", ""))) is not None
+    ]
     per_inverter_kw = [_active_power_reading(f) for f in inverter_findings]
 
     # Only fill in the total when every inverter reading is present — a
@@ -924,6 +964,90 @@ def derive_plant_totals(report: dict) -> dict:
     if per_inverter_kw and all(v is not None for v in per_inverter_kw):
         summary["active_power_kw"] = str(round(sum(per_inverter_kw), 3))
         report["plant_summary"] = summary
+
+    return report
+
+
+# --- Narrative/data consistency guard -------------------------------------
+# apply_measurement_thresholds, apply_peer_comparison, and
+# detect_cross_source_conflicts only ever touch evidence_findings and
+# plant_summary. But executive_summary, root_causes, and corrective_actions
+# are written by the LLM in the SAME call as evidence_findings, based on
+# ITS OWN (pre-escalation) judgment — if the LLM decided everything was
+# NORMAL, those sections say so in full prose, and nothing above ever goes
+# back to update them once a rule forces a finding to WARNING/CRITICAL
+# afterward. The result: a report whose header says WARNING while the
+# executive summary confidently says "no abnormality found," and whose root
+# causes / corrective actions sections are empty or generic "all clear" —
+# which is precisely the kind of internally-contradictory, untrustworthy
+# report this whole effort exists to prevent.
+#
+# This function does NOT try to fabricate the missing engineering analysis
+# itself (writing a plausible-sounding root cause/corrective action without
+# being sure it's right would just be a different flavor of the same
+# problem). It only guarantees the report can never claim "all clear" while
+# escalated findings exist elsewhere in it — by adding an unmissable,
+# factual pointer back to the findings that a human still needs to act on.
+
+def reconcile_narrative_with_findings(report: dict) -> dict:
+    findings = report.get("evidence_findings", [])
+    if not isinstance(findings, list):
+        return report
+
+    escalated = [
+        f for f in findings
+        if isinstance(f, dict) and f.get("severity") in ("WARNING", "CRITICAL")
+    ]
+    if not escalated:
+        return report
+
+    escalated_files = ", ".join(sorted({str(f.get("source_file", "")) for f in escalated}))
+    banner = (
+        f"[หมายเหตุจากระบบตรวจสอบอัตโนมัติ: มี {len(escalated)} รายการที่ถูกยกระดับเป็น WARNING/CRITICAL "
+        f"โดยกฎวิศวกรรมอัตโนมัติ ({escalated_files}) กรุณาอ่านหัวข้อผลการตรวจสอบ (ข้อ 3) โดยละเอียด "
+        "ก่อนสรุปว่าระบบไม่มีความผิดปกติ — บทสรุปด้านล่างนี้อาจเขียนขึ้นก่อนการยกระดับดังกล่าว]\n\n"
+    )
+    summary_text = report.get("executive_summary", "") or ""
+    if "หมายเหตุจากระบบตรวจสอบอัตโนมัติ" not in summary_text:
+        report["executive_summary"] = banner + summary_text
+
+    root_causes = report.get("root_causes", [])
+    if not isinstance(root_causes, list):
+        root_causes = []
+    covered_files = {str(rc.get("supporting_evidence", "")) for rc in root_causes if isinstance(rc, dict)}
+    for f in escalated:
+        source_file = str(f.get("source_file", ""))
+        if any(source_file in c for c in covered_files):
+            continue
+        root_causes.append({
+            "issue": f"{f.get('category', '')} — {source_file} (severity: {f.get('severity')})",
+            "description": (
+                f.get("engineering_diagnosis", "")
+                or "ยกระดับโดยกฎวิศวกรรมอัตโนมัติ ยังไม่มีคำอธิบายเชิงวิเคราะห์จาก AI ระบุไว้ในรอบนี้ "
+                   "ต้องตรวจสอบข้อมูลในหัวข้อผลการตรวจสอบเพิ่มเติมก่อนสรุปสาเหตุ"
+            ),
+            "supporting_evidence": source_file,
+        })
+    report["root_causes"] = root_causes
+
+    corrective_actions = report.get("corrective_actions", [])
+    if not isinstance(corrective_actions, list):
+        corrective_actions = []
+    has_followup_action = any(
+        isinstance(a, dict) and any(f.get("source_file", "") in " ".join(a.get("actions", [])) for f in escalated)
+        for a in corrective_actions
+    )
+    if not has_followup_action:
+        next_step_number = max([a.get("step_number", 0) for a in corrective_actions if isinstance(a, dict)], default=0) + 1
+        corrective_actions.append({
+            "step_number": next_step_number,
+            "title": "ตรวจสอบซ้ำหน้างานสำหรับรายการที่ถูกยกระดับโดยระบบอัตโนมัติ",
+            "actions": [
+                f"ตรวจสอบซ้ำหน้างาน: {escalated_files}",
+                "ยืนยันสาเหตุและความรุนแรงจริงก่อนวางแผนซ่อมบำรุงหรือปิดเคส",
+            ],
+        })
+    report["corrective_actions"] = corrective_actions
 
     return report
 
@@ -1355,7 +1479,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from core.threshold_rules import apply_measurement_thresholds, apply_peer_comparison, derive_plant_totals, detect_cross_source_conflicts
+from core.threshold_rules import apply_measurement_thresholds, apply_peer_comparison, derive_plant_totals, detect_cross_source_conflicts, reconcile_narrative_with_findings
 from router import _enforce_engineering_rules
 
 
@@ -1624,6 +1748,44 @@ def test_existing_active_power_value_is_never_overwritten():
     assert report["plant_summary"]["active_power_kw"] == "18.2"
 
 
+def test_batch_test_file_does_not_pollute_peer_baseline():
+    """Real bug from a live report: 'AC_Inv_1-6.jpg' (an AC-side Megger test
+    covering all 6 inverters at once, reading '>500 MOhm') got filed under
+    'Inverter & Monitoring' — the same category as the 6 individual live
+    dashboard screenshots. Comparing against it inflated the peer baseline
+    to 500 MOhm (a compliance bound from a different measurement method)
+    instead of 20 MOhm (the real best live reading, from Inv_1.jpg), which
+    overstated Inv_2's deviation as 99.8% instead of the correct 95.8%."""
+    report = _report([
+        _finding("Inverter & Monitoring", "Inv_1.jpg", "Insulation resistance 20.000 MOhm"),
+        _finding("Inverter & Monitoring", "Inv_2.jpg", "Insulation resistance 0.836 MOhm"),
+        _finding("Inverter & Monitoring", "Inv_3.jpg", "Insulation resistance 0.867 MOhm"),
+        _finding("Inverter & Monitoring", "Inv_4.jpg", "Insulation resistance 0.921 MOhm"),
+        _finding("Inverter & Monitoring", "AC_Inv_1-6.jpg", "ผลการวัดแสดงค่า >500 MOhm ทุกเฟส"),
+    ])
+    report, locked = apply_measurement_thresholds(report)
+    report = apply_peer_comparison(report)
+    inv2 = [f for f in report["evidence_findings"] if f["source_file"] == "Inv_2.jpg"][0]
+    assert inv2["corroboration"] == "peer_deviation:95.8pct_below_best_peer"
+
+
+def test_batch_test_file_does_not_block_active_power_sum():
+    """Same root cause, different function: AC_Inv_1-6.jpg has no active-power
+    reading at all, so requiring EVERY 'Inverter & Monitoring' finding to
+    have one (including this batch file) meant the sum was abandoned even
+    though all 6 real inverters had a valid reading."""
+    report = {
+        "plant_summary": {"active_power_kw": "UNCONFIRMED"},
+        "evidence_findings": [
+            _finding("Inverter & Monitoring", "Inv_1.jpg", "Active power 1.067 kW"),
+            _finding("Inverter & Monitoring", "Inv_2.jpg", "Active power 3.867 kW"),
+            _finding("Inverter & Monitoring", "AC_Inv_1-6.jpg", "ผลการวัดแสดงค่า >500 MOhm ทุกเฟส"),
+        ],
+    }
+    report = derive_plant_totals(report)
+    assert report["plant_summary"]["active_power_kw"] == "4.934"
+
+
 # --- Peer comparison integration (corroborate or honestly qualify) ------
 
 def test_global_house_full_batch_gets_corroborated_by_peer_deviation():
@@ -1679,6 +1841,84 @@ def test_peer_comparison_leaves_non_escalated_findings_untouched():
     for f in report["evidence_findings"]:
         assert f["severity"] == "NORMAL"
         assert f.get("corroboration") is None
+
+
+# --- Narrative/data consistency guard ------------------------------------
+
+def _full_report(findings, executive_summary="ระบบทำงานสมบูรณ์ ไม่พบความผิดปกติ", root_causes=None, corrective_actions=None):
+    return {
+        "plant_summary": {"overall_status": "WARNING"},
+        "executive_summary": executive_summary,
+        "evidence_findings": findings,
+        "root_causes": root_causes or [],
+        "corrective_actions": corrective_actions or [],
+    }
+
+
+def test_narrative_untouched_when_nothing_escalated():
+    report = _full_report([_finding("Inverter & Monitoring", "Inv_1.jpg", "ปกติ")])
+    result = reconcile_narrative_with_findings(report)
+    assert result["executive_summary"] == "ระบบทำงานสมบูรณ์ ไม่พบความผิดปกติ"
+    assert result["root_causes"] == []
+    assert result["corrective_actions"] == []
+
+
+def test_stale_all_clear_summary_gets_banner_when_findings_are_escalated():
+    """The real bug: header said WARNING, but executive_summary still read
+    'ระบบทำงานสมบูรณ์...ไม่พบความผิดปกติ' because the LLM wrote that BEFORE
+    threshold rules escalated Inv_2. The original text must not be deleted
+    (still useful context) but a reader must not be able to miss the
+    contradiction."""
+    report = _full_report([
+        _finding("Inverter & Monitoring", "Inv_2.jpg", "ต่ำกว่าเกณฑ์", severity="WARNING"),
+    ])
+    result = reconcile_narrative_with_findings(report)
+    assert result["executive_summary"].startswith("[หมายเหตุจากระบบตรวจสอบอัตโนมัติ")
+    assert "ระบบทำงานสมบูรณ์ ไม่พบความผิดปกติ" in result["executive_summary"]  # original kept, not deleted
+    assert "Inv_2.jpg" in result["executive_summary"]
+
+
+def test_empty_root_causes_gets_populated_from_escalated_findings():
+    report = _full_report([
+        _finding("Inverter & Monitoring", "Inv_2.jpg", "ต่ำกว่าเกณฑ์", severity="WARNING", diagnosis="ค่าฉนวนต่ำกว่าเกณฑ์ปลอดภัย"),
+    ], root_causes=[])
+    result = reconcile_narrative_with_findings(report)
+    assert len(result["root_causes"]) == 1
+    assert result["root_causes"][0]["supporting_evidence"] == "Inv_2.jpg"
+    assert "ค่าฉนวนต่ำกว่าเกณฑ์ปลอดภัย" in result["root_causes"][0]["description"]
+
+
+def test_existing_root_cause_covering_the_file_is_not_duplicated():
+    report = _full_report([
+        _finding("Inverter & Monitoring", "Inv_2.jpg", "ต่ำกว่าเกณฑ์", severity="WARNING"),
+    ], root_causes=[{"issue": "Riso ต่ำ", "description": "...", "supporting_evidence": "Inv_2.jpg"}])
+    result = reconcile_narrative_with_findings(report)
+    assert len(result["root_causes"]) == 1  # not duplicated
+
+
+def test_corrective_actions_gets_a_followup_step_when_missing():
+    report = _full_report([
+        _finding("Inverter & Monitoring", "Inv_2.jpg", "ต่ำกว่าเกณฑ์", severity="WARNING"),
+    ], corrective_actions=[{"step_number": 1, "title": "PM ปกติ", "actions": ["บันทึกข้อมูล"]}])
+    result = reconcile_narrative_with_findings(report)
+    assert len(result["corrective_actions"]) == 2
+    assert result["corrective_actions"][1]["step_number"] == 2
+    assert "Inv_2.jpg" in result["corrective_actions"][1]["actions"][0]
+
+
+def test_root_causes_schema_stays_valid_after_reconciliation():
+    """Every field the RootCause/CorrectiveAction pydantic models require
+    must actually be present, or validate_report (which runs right after
+    this in router.py) would reject the whole report."""
+    report = _full_report([
+        _finding("Inverter & Monitoring", "Inv_2.jpg", "ต่ำกว่าเกณฑ์", severity="CRITICAL"),
+    ])
+    result = reconcile_narrative_with_findings(report)
+    for rc in result["root_causes"]:
+        assert set(rc.keys()) >= {"issue", "description", "supporting_evidence"}
+    for ca in result["corrective_actions"]:
+        assert set(ca.keys()) >= {"step_number", "title", "actions"}
+        assert isinstance(ca["step_number"], int) and ca["step_number"] >= 1
 
 
 # --- Coverage for router's existing hard-coded rules (previously untested) --
@@ -1861,5 +2101,5 @@ def test_relative_threshold_is_tunable():
 PYEOF
 
 git add .
-git commit -m "feat: peer comparison for measured values (directional, not median-based); fix UNCONFIRMED-as-zero false CRITICAL bug"
+git commit -m "fix: peer/total calculations no longer polluted by multi-inverter batch test files; reconcile narrative text with escalated findings"
 git push

@@ -5,7 +5,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from core.threshold_rules import apply_measurement_thresholds, apply_peer_comparison, derive_plant_totals, detect_cross_source_conflicts
+from core.threshold_rules import apply_measurement_thresholds, apply_peer_comparison, derive_plant_totals, detect_cross_source_conflicts, reconcile_narrative_with_findings
 from router import _enforce_engineering_rules
 
 
@@ -274,6 +274,44 @@ def test_existing_active_power_value_is_never_overwritten():
     assert report["plant_summary"]["active_power_kw"] == "18.2"
 
 
+def test_batch_test_file_does_not_pollute_peer_baseline():
+    """Real bug from a live report: 'AC_Inv_1-6.jpg' (an AC-side Megger test
+    covering all 6 inverters at once, reading '>500 MOhm') got filed under
+    'Inverter & Monitoring' — the same category as the 6 individual live
+    dashboard screenshots. Comparing against it inflated the peer baseline
+    to 500 MOhm (a compliance bound from a different measurement method)
+    instead of 20 MOhm (the real best live reading, from Inv_1.jpg), which
+    overstated Inv_2's deviation as 99.8% instead of the correct 95.8%."""
+    report = _report([
+        _finding("Inverter & Monitoring", "Inv_1.jpg", "Insulation resistance 20.000 MOhm"),
+        _finding("Inverter & Monitoring", "Inv_2.jpg", "Insulation resistance 0.836 MOhm"),
+        _finding("Inverter & Monitoring", "Inv_3.jpg", "Insulation resistance 0.867 MOhm"),
+        _finding("Inverter & Monitoring", "Inv_4.jpg", "Insulation resistance 0.921 MOhm"),
+        _finding("Inverter & Monitoring", "AC_Inv_1-6.jpg", "ผลการวัดแสดงค่า >500 MOhm ทุกเฟส"),
+    ])
+    report, locked = apply_measurement_thresholds(report)
+    report = apply_peer_comparison(report)
+    inv2 = [f for f in report["evidence_findings"] if f["source_file"] == "Inv_2.jpg"][0]
+    assert inv2["corroboration"] == "peer_deviation:95.8pct_below_best_peer"
+
+
+def test_batch_test_file_does_not_block_active_power_sum():
+    """Same root cause, different function: AC_Inv_1-6.jpg has no active-power
+    reading at all, so requiring EVERY 'Inverter & Monitoring' finding to
+    have one (including this batch file) meant the sum was abandoned even
+    though all 6 real inverters had a valid reading."""
+    report = {
+        "plant_summary": {"active_power_kw": "UNCONFIRMED"},
+        "evidence_findings": [
+            _finding("Inverter & Monitoring", "Inv_1.jpg", "Active power 1.067 kW"),
+            _finding("Inverter & Monitoring", "Inv_2.jpg", "Active power 3.867 kW"),
+            _finding("Inverter & Monitoring", "AC_Inv_1-6.jpg", "ผลการวัดแสดงค่า >500 MOhm ทุกเฟส"),
+        ],
+    }
+    report = derive_plant_totals(report)
+    assert report["plant_summary"]["active_power_kw"] == "4.934"
+
+
 # --- Peer comparison integration (corroborate or honestly qualify) ------
 
 def test_global_house_full_batch_gets_corroborated_by_peer_deviation():
@@ -329,6 +367,84 @@ def test_peer_comparison_leaves_non_escalated_findings_untouched():
     for f in report["evidence_findings"]:
         assert f["severity"] == "NORMAL"
         assert f.get("corroboration") is None
+
+
+# --- Narrative/data consistency guard ------------------------------------
+
+def _full_report(findings, executive_summary="ระบบทำงานสมบูรณ์ ไม่พบความผิดปกติ", root_causes=None, corrective_actions=None):
+    return {
+        "plant_summary": {"overall_status": "WARNING"},
+        "executive_summary": executive_summary,
+        "evidence_findings": findings,
+        "root_causes": root_causes or [],
+        "corrective_actions": corrective_actions or [],
+    }
+
+
+def test_narrative_untouched_when_nothing_escalated():
+    report = _full_report([_finding("Inverter & Monitoring", "Inv_1.jpg", "ปกติ")])
+    result = reconcile_narrative_with_findings(report)
+    assert result["executive_summary"] == "ระบบทำงานสมบูรณ์ ไม่พบความผิดปกติ"
+    assert result["root_causes"] == []
+    assert result["corrective_actions"] == []
+
+
+def test_stale_all_clear_summary_gets_banner_when_findings_are_escalated():
+    """The real bug: header said WARNING, but executive_summary still read
+    'ระบบทำงานสมบูรณ์...ไม่พบความผิดปกติ' because the LLM wrote that BEFORE
+    threshold rules escalated Inv_2. The original text must not be deleted
+    (still useful context) but a reader must not be able to miss the
+    contradiction."""
+    report = _full_report([
+        _finding("Inverter & Monitoring", "Inv_2.jpg", "ต่ำกว่าเกณฑ์", severity="WARNING"),
+    ])
+    result = reconcile_narrative_with_findings(report)
+    assert result["executive_summary"].startswith("[หมายเหตุจากระบบตรวจสอบอัตโนมัติ")
+    assert "ระบบทำงานสมบูรณ์ ไม่พบความผิดปกติ" in result["executive_summary"]  # original kept, not deleted
+    assert "Inv_2.jpg" in result["executive_summary"]
+
+
+def test_empty_root_causes_gets_populated_from_escalated_findings():
+    report = _full_report([
+        _finding("Inverter & Monitoring", "Inv_2.jpg", "ต่ำกว่าเกณฑ์", severity="WARNING", diagnosis="ค่าฉนวนต่ำกว่าเกณฑ์ปลอดภัย"),
+    ], root_causes=[])
+    result = reconcile_narrative_with_findings(report)
+    assert len(result["root_causes"]) == 1
+    assert result["root_causes"][0]["supporting_evidence"] == "Inv_2.jpg"
+    assert "ค่าฉนวนต่ำกว่าเกณฑ์ปลอดภัย" in result["root_causes"][0]["description"]
+
+
+def test_existing_root_cause_covering_the_file_is_not_duplicated():
+    report = _full_report([
+        _finding("Inverter & Monitoring", "Inv_2.jpg", "ต่ำกว่าเกณฑ์", severity="WARNING"),
+    ], root_causes=[{"issue": "Riso ต่ำ", "description": "...", "supporting_evidence": "Inv_2.jpg"}])
+    result = reconcile_narrative_with_findings(report)
+    assert len(result["root_causes"]) == 1  # not duplicated
+
+
+def test_corrective_actions_gets_a_followup_step_when_missing():
+    report = _full_report([
+        _finding("Inverter & Monitoring", "Inv_2.jpg", "ต่ำกว่าเกณฑ์", severity="WARNING"),
+    ], corrective_actions=[{"step_number": 1, "title": "PM ปกติ", "actions": ["บันทึกข้อมูล"]}])
+    result = reconcile_narrative_with_findings(report)
+    assert len(result["corrective_actions"]) == 2
+    assert result["corrective_actions"][1]["step_number"] == 2
+    assert "Inv_2.jpg" in result["corrective_actions"][1]["actions"][0]
+
+
+def test_root_causes_schema_stays_valid_after_reconciliation():
+    """Every field the RootCause/CorrectiveAction pydantic models require
+    must actually be present, or validate_report (which runs right after
+    this in router.py) would reject the whole report."""
+    report = _full_report([
+        _finding("Inverter & Monitoring", "Inv_2.jpg", "ต่ำกว่าเกณฑ์", severity="CRITICAL"),
+    ])
+    result = reconcile_narrative_with_findings(report)
+    for rc in result["root_causes"]:
+        assert set(rc.keys()) >= {"issue", "description", "supporting_evidence"}
+    for ca in result["corrective_actions"]:
+        assert set(ca.keys()) >= {"step_number", "title", "actions"}
+        assert isinstance(ca["step_number"], int) and ca["step_number"] >= 1
 
 
 # --- Coverage for router's existing hard-coded rules (previously untested) --
