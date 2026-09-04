@@ -76,6 +76,11 @@ class EvidenceFinding(BaseModel):
     engineering_diagnosis: str
     severity: Severity
     key_measurements: list[Measurement] = Field(default_factory=list)
+    # Set by core/threshold_rules.py, never by the LLM: records WHY an
+    # automatic severity escalation happened, so the report never asserts
+    # "violates safety standard" with more confidence than the evidence
+    # actually supports. None = severity wasn't auto-escalated by a rule.
+    corroboration: str | None = None
 
 
 class RootCause(BaseModel):

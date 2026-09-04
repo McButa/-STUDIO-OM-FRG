@@ -6,7 +6,7 @@ from core.docx_generator import build_docx
 from core.evidence_validator import coerce_float, validate_report
 from core.job_manifest import build_manifest, manifest_summary
 from core.reference_reader import extract_reference_context
-from core.threshold_rules import apply_measurement_thresholds, derive_plant_totals, detect_cross_source_conflicts
+from core.threshold_rules import apply_measurement_thresholds, apply_peer_comparison, derive_plant_totals, detect_cross_source_conflicts
 from database.db_manager import get_plant_history_context, get_previous_audit_kpis, get_similar_cases_context
 from engines.master_engine import run_master_analysis
 from engines.verification_engine import run_critical_verification
@@ -68,9 +68,17 @@ def _keyword_present_unnegated(text: str, keyword: str, window: int = 30) -> boo
 
 def _enforce_engineering_rules(report: dict) -> tuple:
     summary = report.get("plant_summary", {})
-    p_act = coerce_float(summary.get("active_power_kw")) or 0.0
-    p_rated = coerce_float(summary.get("rated_capacity_kw")) or 0.0
-    i_grid = coerce_float(summary.get("grid_current_a")) or 0.0
+    p_act_raw = coerce_float(summary.get("active_power_kw"))
+    p_rated_raw = coerce_float(summary.get("rated_capacity_kw"))
+    i_grid_raw = coerce_float(summary.get("grid_current_a"))
+    # `or 0.0` below is only for the arithmetic once we've already confirmed
+    # (in the Rule 1 condition) that these aren't None — an UNCONFIRMED/
+    # unparseable reading must never be silently read as a confirmed zero,
+    # or "we don't know the output" gets treated as "output is zero" and
+    # forces a false CRITICAL on an otherwise healthy plant.
+    p_act = p_act_raw or 0.0
+    p_rated = p_rated_raw or 0.0
+    i_grid = i_grid_raw or 0.0
 
     findings_text = " ".join([
         f"{f.get('observed_data', '')} {f.get('engineering_diagnosis', '')}"
@@ -79,7 +87,8 @@ def _enforce_engineering_rules(report: dict) -> tuple:
 
     hard_locked = False
     # Rule 1: Zero Grid Current or severe power drop (<5%) -> Lock to CRITICAL
-    if (p_rated > 0 and (p_act / p_rated) < 0.05 and i_grid == 0) or "grid a/b/c phase current: 0" in findings_text or "grid current: 0" in findings_text or "grid current เป็น 0" in findings_text:
+    values_confirmed = p_act_raw is not None and p_rated_raw is not None and i_grid_raw is not None
+    if (values_confirmed and p_rated > 0 and (p_act / p_rated) < 0.05 and i_grid == 0) or "grid a/b/c phase current: 0" in findings_text or "grid current: 0" in findings_text or "grid current เป็น 0" in findings_text:
         summary["overall_status"] = "CRITICAL"
         hard_locked = True
     # Rule 2: Active Ground Fault / Short Circuit / Major Alarms -> Lock to CRITICAL
@@ -140,6 +149,7 @@ def process_field_report(uploaded_files, api_key: str, plant_name: str = "", lan
     report = derive_plant_totals(report)
     report, status_hard_locked = _enforce_engineering_rules(report)
     report, measurement_locked = apply_measurement_thresholds(report)
+    report = apply_peer_comparison(report)
     report = detect_cross_source_conflicts(report)
     status_hard_locked = status_hard_locked or measurement_locked
     report = validate_report(report)

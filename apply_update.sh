@@ -367,7 +367,7 @@ from core.docx_generator import build_docx
 from core.evidence_validator import coerce_float, validate_report
 from core.job_manifest import build_manifest, manifest_summary
 from core.reference_reader import extract_reference_context
-from core.threshold_rules import apply_measurement_thresholds, derive_plant_totals, detect_cross_source_conflicts
+from core.threshold_rules import apply_measurement_thresholds, apply_peer_comparison, derive_plant_totals, detect_cross_source_conflicts
 from database.db_manager import get_plant_history_context, get_previous_audit_kpis, get_similar_cases_context
 from engines.master_engine import run_master_analysis
 from engines.verification_engine import run_critical_verification
@@ -429,9 +429,17 @@ def _keyword_present_unnegated(text: str, keyword: str, window: int = 30) -> boo
 
 def _enforce_engineering_rules(report: dict) -> tuple:
     summary = report.get("plant_summary", {})
-    p_act = coerce_float(summary.get("active_power_kw")) or 0.0
-    p_rated = coerce_float(summary.get("rated_capacity_kw")) or 0.0
-    i_grid = coerce_float(summary.get("grid_current_a")) or 0.0
+    p_act_raw = coerce_float(summary.get("active_power_kw"))
+    p_rated_raw = coerce_float(summary.get("rated_capacity_kw"))
+    i_grid_raw = coerce_float(summary.get("grid_current_a"))
+    # `or 0.0` below is only for the arithmetic once we've already confirmed
+    # (in the Rule 1 condition) that these aren't None — an UNCONFIRMED/
+    # unparseable reading must never be silently read as a confirmed zero,
+    # or "we don't know the output" gets treated as "output is zero" and
+    # forces a false CRITICAL on an otherwise healthy plant.
+    p_act = p_act_raw or 0.0
+    p_rated = p_rated_raw or 0.0
+    i_grid = i_grid_raw or 0.0
 
     findings_text = " ".join([
         f"{f.get('observed_data', '')} {f.get('engineering_diagnosis', '')}"
@@ -440,7 +448,8 @@ def _enforce_engineering_rules(report: dict) -> tuple:
 
     hard_locked = False
     # Rule 1: Zero Grid Current or severe power drop (<5%) -> Lock to CRITICAL
-    if (p_rated > 0 and (p_act / p_rated) < 0.05 and i_grid == 0) or "grid a/b/c phase current: 0" in findings_text or "grid current: 0" in findings_text or "grid current เป็น 0" in findings_text:
+    values_confirmed = p_act_raw is not None and p_rated_raw is not None and i_grid_raw is not None
+    if (values_confirmed and p_rated > 0 and (p_act / p_rated) < 0.05 and i_grid == 0) or "grid a/b/c phase current: 0" in findings_text or "grid current: 0" in findings_text or "grid current เป็น 0" in findings_text:
         summary["overall_status"] = "CRITICAL"
         hard_locked = True
     # Rule 2: Active Ground Fault / Short Circuit / Major Alarms -> Lock to CRITICAL
@@ -501,6 +510,7 @@ def process_field_report(uploaded_files, api_key: str, plant_name: str = "", lan
     report = derive_plant_totals(report)
     report, status_hard_locked = _enforce_engineering_rules(report)
     report, measurement_locked = apply_measurement_thresholds(report)
+    report = apply_peer_comparison(report)
     report = detect_cross_source_conflicts(report)
     status_hard_locked = status_hard_locked or measurement_locked
     report = validate_report(report)
@@ -580,6 +590,8 @@ not just missing code):
 
 import re
 
+from core.peer_comparison import compare_to_peers
+
 SEVERITY_RANK = {"NORMAL": 0, "INFORMATIONAL": 0, "WARNING": 1, "CRITICAL": 2}
 
 
@@ -624,6 +636,9 @@ MEASUREMENT_RULES = [
         "value_pattern": re.compile(r"(>|<)?\s*([\d.]+)\s*(?:m\W?ohm|m\W?\u03a9|megaohm)", re.IGNORECASE),
         # (comparator, limit, severity) — value compared against limit.
         "thresholds": [("<", 0.5, "CRITICAL"), ("<", 1.0, "WARNING")],
+        # For peer comparison: a smaller insulation-resistance reading is the
+        # concerning direction.
+        "bad_direction": "low",
     },
 ]
 
@@ -691,6 +706,7 @@ def apply_measurement_thresholds(report: dict) -> tuple:
             new_severity = _higher(current, rule_severity)
             if new_severity != current:
                 finding["severity"] = new_severity
+                finding["corroboration"] = "threshold_only"  # refined by apply_peer_comparison, if it runs
                 finding["engineering_diagnosis"] = (
                     finding.get("engineering_diagnosis", "").rstrip()
                     + f" [กฎอัตโนมัติ: {rule['name']} วัดได้ {value} MOhm ต่ำกว่าเกณฑ์ปลอดภัย บังคับ severity เป็น {new_severity}]"
@@ -712,7 +728,69 @@ def apply_measurement_thresholds(report: dict) -> tuple:
     return report, escalated_to_critical
 
 
-# --- Cross-source conflict detection ------------------------------------
+# --- Peer comparison: corroborate or honestly qualify threshold escalations --
+# apply_measurement_thresholds tags a finding "threshold_only" when the raw
+# number alone crossed a line borrowed from a general standard (e.g. IEC
+# 62446-1 Megger limits) that may not actually be the right limit for THIS
+# equipment's live self-monitoring reading (see core/peer_comparison.py
+# docstring for the full reasoning). This function runs after it and either:
+#   - corroborates the escalation with real evidence (this unit performs far
+#     worse than its peers under identical conditions right now), or
+#   - honestly downgrades the CERTAINTY of the wording (not the severity —
+#     severity stays elevated, so a real problem is never silently dropped
+#     back to NORMAL) when no peer or reference data backs up the number.
+
+def apply_peer_comparison(report: dict) -> dict:
+    findings = report.get("evidence_findings", [])
+    if not isinstance(findings, list):
+        return report
+
+    for rule in MEASUREMENT_RULES:
+        bad_direction = rule.get("bad_direction")
+        if not bad_direction:
+            continue
+
+        category_findings = [
+            f for f in findings
+            if isinstance(f, dict) and f.get("category") == rule["applies_to_category"]
+        ]
+        readings = []
+        for idx, finding in enumerate(category_findings):
+            value, _sign = _reading_for_rule(finding, rule)
+            if value is not None:
+                readings.append({"id": idx, "value": value, "finding": finding})
+
+        peer_results = compare_to_peers(
+            [{"id": r["id"], "value": r["value"]} for r in readings],
+            bad_direction=bad_direction,
+        )
+        outlier_ids = {r["id"] for r in peer_results if r["is_outlier"]}
+        peer_result_by_id = {r["id"]: r for r in peer_results}
+
+        for r in readings:
+            finding = r["finding"]
+            if finding.get("corroboration") != "threshold_only":
+                continue  # not an escalation from this rule, leave untouched
+            if r["id"] in outlier_ids:
+                pr = peer_result_by_id[r["id"]]
+                finding["corroboration"] = f"peer_deviation:{pr['deviation_pct']}pct_below_best_peer"
+                finding["engineering_diagnosis"] = (
+                    finding.get("engineering_diagnosis", "").rstrip()
+                    + f" [ยืนยันเพิ่มเติม: เบี่ยงเบนจากเครื่องเพื่อนร่วมชุดตรวจที่ดีที่สุด ({pr['baseline']} MOhm) อยู่ {pr['deviation_pct']}% "
+                    "ซึ่งสูงกว่าค่าความแปรปรวนปกติของเครื่องรุ่นเดียวกันภายใต้เงื่อนไขเดียวกันอย่างมีนัยสำคัญ]"
+                )
+            else:
+                finding["corroboration"] = "threshold_only_unverified"
+                finding["engineering_diagnosis"] = (
+                    finding.get("engineering_diagnosis", "").rstrip()
+                    + " [หมายเหตุ: ยังไม่มีข้อมูลอ้างอิงเฉพาะรุ่นอุปกรณ์นี้ และไม่พบการเบี่ยงเบนจากเครื่องเพื่อนร่วมชุดตรวจอย่างมีนัยสำคัญ "
+                    "ผลประเมินนี้อิงเกณฑ์ทั่วไปเบื้องต้นเท่านั้น แนะนำให้ตรวจสอบหน้างานเพื่อยืนยันก่อนสรุปเป็นข้อบกพร่องที่ยืนยันแล้ว]"
+                )
+
+    return report
+
+
+
 # Not a single-number threshold, so it earns its own function rather than a
 # MEASUREMENT_RULES entry — but it's still fully deterministic (no LLM call).
 
@@ -930,6 +1008,11 @@ class EvidenceFinding(BaseModel):
     engineering_diagnosis: str
     severity: Severity
     key_measurements: list[Measurement] = Field(default_factory=list)
+    # Set by core/threshold_rules.py, never by the LLM: records WHY an
+    # automatic severity escalation happened, so the report never asserts
+    # "violates safety standard" with more confidence than the evidence
+    # actually supports. None = severity wasn't auto-escalated by a rule.
+    corroboration: str | None = None
 
 
 class RootCause(BaseModel):
@@ -1018,6 +1101,86 @@ def validate_report(data: dict) -> dict:
             cause["description"] = "UNCONFIRMED_HYPOTHESIS"
             cause["supporting_evidence"] = "UNCONFIRMED"
     return result
+
+PYEOF
+
+cat > core/peer_comparison.py << 'PYEOF'
+"""
+Directional peer comparison for measured values across equipment of the same
+category, in the same evidence batch (same site visit).
+
+WHY NOT median/MAD (the "textbook" outlier stat): I tried it first, by hand,
+against the exact Global House Phitsanulok numbers before writing this file.
+Insulation resistance readings were [Inv1: 20, Inv2: 0.836, Inv3: 0.867,
+Inv4: 0.921, Inv5: 0.872, Inv6: 13.541] MOhm. Four of the six units read low
+— so the median sits inside the LOW cluster, and a standard median/MAD
+outlier test flags Inv1 and Inv6 (the two healthy units) as the "anomaly"
+and leaves Inv2-5 (the actually degraded ones) alone. That is exactly
+backwards, and it is precisely the kind of technically-correct-but-
+engineering-wrong mistake this whole exercise is trying to eliminate.
+Majority-vote statistics cannot tell you which direction is "bad" — only a
+human (or a known physical direction of concern) can.
+
+So instead: every parameter this module is used for must declare a
+`bad_direction` ("low" or "high" — is a smaller or larger number the
+concerning one). The comparison baseline is the BEST reading currently
+observed among the peers (max, if low=bad; min, if high=bad) — i.e. "what
+these units are demonstrably capable of reading right now, under today's
+identical conditions." A unit is flagged when it falls meaningfully short of
+that achievable baseline, regardless of whether it's in the majority or the
+minority of the batch. This correctly flags Inv2-5 above (they're ~95%
+below what Inv1 proves is achievable right now) and correctly leaves a
+uniform "all six units read 70-90 degC" batch alone (nothing falls far
+short of its peers' best, even though the absolute numbers might be high).
+"""
+
+MIN_PEERS = 4  # below this, "peer comparison" isn't statistically meaningful
+DEFAULT_RELATIVE_THRESHOLD_PCT = 40.0
+
+
+def compare_to_peers(readings: list, bad_direction: str, relative_threshold_pct: float = DEFAULT_RELATIVE_THRESHOLD_PCT, min_peers: int = MIN_PEERS) -> list:
+    """
+    readings: list of {"id": <anything>, "value": float}, all for the SAME
+        parameter, SAME category, SAME evidence batch.
+    bad_direction: "low" (smaller value = worse, e.g. insulation resistance)
+        or "high" (larger value = worse, e.g. temperature).
+    relative_threshold_pct: how far short of the best peer's reading (as a
+        percentage of that reading) a unit must fall before it's flagged.
+        Not an absolute engineering limit — a statement about this specific
+        batch, right now: "meaningfully worse than what peers just proved is
+        achievable under the same conditions."
+    min_peers: fewer than this many comparable readings and peer comparison
+        doesn't mean anything statistically — returns [] rather than forcing
+        a comparison out of too little data.
+
+    Returns a list of dicts (one per input reading, same order), each with
+    the original keys plus: baseline, deviation_pct, is_outlier.
+    Returns [] if len(readings) < min_peers.
+    """
+    if bad_direction not in ("low", "high"):
+        raise ValueError("bad_direction must be 'low' or 'high'")
+    if len(readings) < min_peers:
+        return []
+
+    values = [r["value"] for r in readings]
+    baseline = max(values) if bad_direction == "low" else min(values)
+
+    results = []
+    for r in readings:
+        value = r["value"]
+        if baseline == 0:
+            deviation_pct = 0.0
+        elif bad_direction == "low":
+            deviation_pct = max((baseline - value) / baseline * 100, 0.0)
+        else:
+            deviation_pct = max((value - baseline) / baseline * 100, 0.0)
+        results.append({
+            **r,
+            "baseline": baseline,
+            "deviation_pct": round(deviation_pct, 1),
+            "is_outlier": deviation_pct >= relative_threshold_pct,
+        })
+    return results
 
 PYEOF
 
@@ -1192,7 +1355,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from core.threshold_rules import apply_measurement_thresholds, derive_plant_totals, detect_cross_source_conflicts
+from core.threshold_rules import apply_measurement_thresholds, apply_peer_comparison, derive_plant_totals, detect_cross_source_conflicts
 from router import _enforce_engineering_rules
 
 
@@ -1461,6 +1624,63 @@ def test_existing_active_power_value_is_never_overwritten():
     assert report["plant_summary"]["active_power_kw"] == "18.2"
 
 
+# --- Peer comparison integration (corroborate or honestly qualify) ------
+
+def test_global_house_full_batch_gets_corroborated_by_peer_deviation():
+    """Full 6-inverter batch: the WARNING escalation for Inv2-5 should come
+    out CORROBORATED (peer_deviation), because Inv1/Inv6 prove 13-20 MOhm was
+    achievable under the same conditions right now — this is no longer just
+    'a number crossed a generic line', it's a verified anomaly."""
+    report = _report([
+        _finding("Inverter & Monitoring", "Inv_1.jpg", "Insulation resistance: 20.000 MOhm"),
+        _finding("Inverter & Monitoring", "Inv_2.jpg", "Insulation resistance: 0.836 MOhm"),
+        _finding("Inverter & Monitoring", "Inv_3.jpg", "Insulation resistance: 0.867 MOhm"),
+        _finding("Inverter & Monitoring", "Inv_4.jpg", "Insulation resistance: 0.921 MOhm"),
+        _finding("Inverter & Monitoring", "Inv_5.jpg", "Insulation resistance: 0.872 MOhm"),
+        _finding("Inverter & Monitoring", "Inv_6.jpg", "Insulation resistance: 13.541 MOhm"),
+    ])
+    report, locked = apply_measurement_thresholds(report)
+    report = apply_peer_comparison(report)
+    findings_by_file = {f["source_file"]: f for f in report["evidence_findings"]}
+    for f in ["Inv_2.jpg", "Inv_3.jpg", "Inv_4.jpg", "Inv_5.jpg"]:
+        assert findings_by_file[f]["severity"] == "WARNING"
+        assert findings_by_file[f]["corroboration"].startswith("peer_deviation:")
+    assert findings_by_file["Inv_1.jpg"]["severity"] == "NORMAL"
+    assert findings_by_file["Inv_6.jpg"]["severity"] == "NORMAL"
+
+
+def test_single_low_reading_with_no_peers_stays_warning_but_wording_is_honestly_qualified():
+    """This is the exact concern the user raised: without knowing this
+    inverter model's real normal range, and with no peers to compare against,
+    the system must NOT confidently claim 'violates safety standard'. But it
+    also must not silently drop back to NORMAL — that reintroduces the
+    original disaster (a real risk called normal). Severity stays WARNING;
+    only the certainty of the wording changes."""
+    report = _report([
+        _finding("Inverter & Monitoring", "Inv_2.jpg", "Insulation resistance: 0.836 MOhm"),
+    ])
+    report, locked = apply_measurement_thresholds(report)
+    report = apply_peer_comparison(report)
+    finding = report["evidence_findings"][0]
+    assert finding["severity"] == "WARNING"  # never silently downgraded
+    assert finding["corroboration"] == "threshold_only_unverified"
+    assert "ยังไม่มีข้อมูลอ้างอิงเฉพาะรุ่น" in finding["engineering_diagnosis"]
+
+
+def test_peer_comparison_leaves_non_escalated_findings_untouched():
+    report = _report([
+        _finding("Inverter & Monitoring", "Inv_1.jpg", "Insulation resistance: 20.000 MOhm"),
+        _finding("Inverter & Monitoring", "Inv_2.jpg", "Insulation resistance: 19.500 MOhm"),
+        _finding("Inverter & Monitoring", "Inv_3.jpg", "Insulation resistance: 18.900 MOhm"),
+        _finding("Inverter & Monitoring", "Inv_4.jpg", "Insulation resistance: 20.100 MOhm"),
+    ])
+    report, locked = apply_measurement_thresholds(report)
+    report = apply_peer_comparison(report)
+    for f in report["evidence_findings"]:
+        assert f["severity"] == "NORMAL"
+        assert f.get("corroboration") is None
+
+
 # --- Coverage for router's existing hard-coded rules (previously untested) --
 
 def test_zero_grid_current_locks_critical():
@@ -1471,6 +1691,22 @@ def test_zero_grid_current_locks_critical():
     report, locked = _enforce_engineering_rules(report)
     assert report["plant_summary"]["overall_status"] == "CRITICAL"
     assert locked is True
+
+
+def test_unconfirmed_active_power_and_grid_current_does_not_falsely_lock_critical():
+    """Found during end-to-end verification: coerce_float('UNCONFIRMED') is
+    None, and 'None or 0.0' silently became 0.0 — so a plant where the LLM
+    simply couldn't extract active_power_kw/grid_current_a (not because
+    output is actually zero) was being hard-locked CRITICAL as if it had
+    confirmed zero output. Not knowing the value must never be treated as
+    knowing it's zero."""
+    report = {
+        "plant_summary": {"overall_status": "NORMAL", "active_power_kw": "UNCONFIRMED", "grid_current_a": "UNCONFIRMED", "rated_capacity_kw": "20"},
+        "evidence_findings": [{"observed_data": "ปกติทุกจุด", "engineering_diagnosis": ""}],
+    }
+    report, locked = _enforce_engineering_rules(report)
+    assert report["plant_summary"]["overall_status"] != "CRITICAL"
+    assert locked is False
 
 
 def test_ground_fault_keyword_locks_critical():
@@ -1523,6 +1759,107 @@ def test_real_unnegated_ground_fault_still_locks_critical():
 
 PYEOF
 
+cat > tests/test_peer_comparison.py << 'PYEOF'
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from core.peer_comparison import compare_to_peers
+
+
+def test_returns_empty_below_min_peers():
+    readings = [{"id": "A", "value": 1.0}, {"id": "B", "value": 2.0}]
+    assert compare_to_peers(readings, bad_direction="low") == []
+
+
+def test_global_house_case_flags_the_actually_degraded_units_not_the_healthy_ones():
+    """The exact numbers from the real Global House Phitsanulok report. Four of
+    six units read low (0.836-0.921) and two read healthy (13.541, 20.0). A
+    median/MAD outlier test would flag the two healthy units as the anomaly,
+    because they're the numeric minority. This must flag the four degraded
+    ones instead, regardless of which side is the majority."""
+    readings = [
+        {"id": "Inv1", "value": 20.000},
+        {"id": "Inv2", "value": 0.836},
+        {"id": "Inv3", "value": 0.867},
+        {"id": "Inv4", "value": 0.921},
+        {"id": "Inv5", "value": 0.872},
+        {"id": "Inv6", "value": 13.541},
+    ]
+    results = compare_to_peers(readings, bad_direction="low")
+    flagged = {r["id"] for r in results if r["is_outlier"]}
+    assert flagged == {"Inv2", "Inv3", "Inv4", "Inv5"}
+    assert "Inv1" not in flagged and "Inv6" not in flagged
+
+
+def test_uniformly_high_readings_are_not_flagged_when_all_peers_agree():
+    """Global House Phitsanulok temperature scenario, generalized: if a
+    quirk of this equipment model means every unit normally reads 70-90 degC,
+    peer comparison must not manufacture an alarm just because the absolute
+    numbers look high — nothing here falls short of what its peers show."""
+    readings = [
+        {"id": f"Inv{i}", "value": v}
+        for i, v in enumerate([70, 75, 80, 85, 88, 90], start=1)
+    ]
+    results = compare_to_peers(readings, bad_direction="high")
+    assert all(not r["is_outlier"] for r in results)
+
+
+def test_single_genuine_outlier_among_healthy_peers_is_flagged():
+    readings = [
+        {"id": "Inv1", "value": 20.0},
+        {"id": "Inv2", "value": 19.5},
+        {"id": "Inv3", "value": 0.5},   # the one bad apple
+        {"id": "Inv4", "value": 18.9},
+    ]
+    results = compare_to_peers(readings, bad_direction="low")
+    flagged = {r["id"] for r in results if r["is_outlier"]}
+    assert flagged == {"Inv3"}
+
+
+def test_high_bad_direction_flags_the_hottest_unit():
+    readings = [
+        {"id": "Inv1", "value": 45.0},
+        {"id": "Inv2", "value": 48.0},
+        {"id": "Inv3", "value": 47.0},
+        {"id": "Inv4", "value": 95.0},  # runs much hotter than its peers
+    ]
+    results = compare_to_peers(readings, bad_direction="high")
+    flagged = {r["id"] for r in results if r["is_outlier"]}
+    assert flagged == {"Inv4"}
+
+
+def test_zero_baseline_does_not_crash():
+    readings = [{"id": f"U{i}", "value": 0.0} for i in range(5)]
+    results = compare_to_peers(readings, bad_direction="low")
+    assert all(r["deviation_pct"] == 0.0 and not r["is_outlier"] for r in results)
+
+
+def test_invalid_bad_direction_raises():
+    import pytest
+    with pytest.raises(ValueError):
+        compare_to_peers([{"id": "A", "value": 1.0}] * 4, bad_direction="sideways")
+
+
+def test_relative_threshold_is_tunable():
+    readings = [
+        {"id": "Inv1", "value": 20.0},
+        {"id": "Inv2", "value": 15.0},  # 25% below baseline
+        {"id": "Inv3", "value": 19.0},
+        {"id": "Inv4", "value": 18.0},
+    ]
+    # default 40% threshold: 25% shortfall should NOT be flagged
+    default_results = compare_to_peers(readings, bad_direction="low")
+    assert not any(r["is_outlier"] for r in default_results if r["id"] == "Inv2")
+    # a stricter 20% threshold: the same 25% shortfall SHOULD be flagged
+    strict_results = compare_to_peers(readings, bad_direction="low", relative_threshold_pct=20.0)
+    assert [r for r in strict_results if r["id"] == "Inv2"][0]["is_outlier"] is True
+
+PYEOF
+
 git add .
-git commit -m "feat: structured key_measurements as primary data source; sum active_power_kw safely; never auto-derive grid_current_a/rated_capacity_kw"
+git commit -m "feat: peer comparison for measured values (directional, not median-based); fix UNCONFIRMED-as-zero false CRITICAL bug"
 git push

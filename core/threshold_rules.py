@@ -47,6 +47,8 @@ not just missing code):
 
 import re
 
+from core.peer_comparison import compare_to_peers
+
 SEVERITY_RANK = {"NORMAL": 0, "INFORMATIONAL": 0, "WARNING": 1, "CRITICAL": 2}
 
 
@@ -91,6 +93,9 @@ MEASUREMENT_RULES = [
         "value_pattern": re.compile(r"(>|<)?\s*([\d.]+)\s*(?:m\W?ohm|m\W?\u03a9|megaohm)", re.IGNORECASE),
         # (comparator, limit, severity) — value compared against limit.
         "thresholds": [("<", 0.5, "CRITICAL"), ("<", 1.0, "WARNING")],
+        # For peer comparison: a smaller insulation-resistance reading is the
+        # concerning direction.
+        "bad_direction": "low",
     },
 ]
 
@@ -158,6 +163,7 @@ def apply_measurement_thresholds(report: dict) -> tuple:
             new_severity = _higher(current, rule_severity)
             if new_severity != current:
                 finding["severity"] = new_severity
+                finding["corroboration"] = "threshold_only"  # refined by apply_peer_comparison, if it runs
                 finding["engineering_diagnosis"] = (
                     finding.get("engineering_diagnosis", "").rstrip()
                     + f" [กฎอัตโนมัติ: {rule['name']} วัดได้ {value} MOhm ต่ำกว่าเกณฑ์ปลอดภัย บังคับ severity เป็น {new_severity}]"
@@ -179,7 +185,69 @@ def apply_measurement_thresholds(report: dict) -> tuple:
     return report, escalated_to_critical
 
 
-# --- Cross-source conflict detection ------------------------------------
+# --- Peer comparison: corroborate or honestly qualify threshold escalations --
+# apply_measurement_thresholds tags a finding "threshold_only" when the raw
+# number alone crossed a line borrowed from a general standard (e.g. IEC
+# 62446-1 Megger limits) that may not actually be the right limit for THIS
+# equipment's live self-monitoring reading (see core/peer_comparison.py
+# docstring for the full reasoning). This function runs after it and either:
+#   - corroborates the escalation with real evidence (this unit performs far
+#     worse than its peers under identical conditions right now), or
+#   - honestly downgrades the CERTAINTY of the wording (not the severity —
+#     severity stays elevated, so a real problem is never silently dropped
+#     back to NORMAL) when no peer or reference data backs up the number.
+
+def apply_peer_comparison(report: dict) -> dict:
+    findings = report.get("evidence_findings", [])
+    if not isinstance(findings, list):
+        return report
+
+    for rule in MEASUREMENT_RULES:
+        bad_direction = rule.get("bad_direction")
+        if not bad_direction:
+            continue
+
+        category_findings = [
+            f for f in findings
+            if isinstance(f, dict) and f.get("category") == rule["applies_to_category"]
+        ]
+        readings = []
+        for idx, finding in enumerate(category_findings):
+            value, _sign = _reading_for_rule(finding, rule)
+            if value is not None:
+                readings.append({"id": idx, "value": value, "finding": finding})
+
+        peer_results = compare_to_peers(
+            [{"id": r["id"], "value": r["value"]} for r in readings],
+            bad_direction=bad_direction,
+        )
+        outlier_ids = {r["id"] for r in peer_results if r["is_outlier"]}
+        peer_result_by_id = {r["id"]: r for r in peer_results}
+
+        for r in readings:
+            finding = r["finding"]
+            if finding.get("corroboration") != "threshold_only":
+                continue  # not an escalation from this rule, leave untouched
+            if r["id"] in outlier_ids:
+                pr = peer_result_by_id[r["id"]]
+                finding["corroboration"] = f"peer_deviation:{pr['deviation_pct']}pct_below_best_peer"
+                finding["engineering_diagnosis"] = (
+                    finding.get("engineering_diagnosis", "").rstrip()
+                    + f" [ยืนยันเพิ่มเติม: เบี่ยงเบนจากเครื่องเพื่อนร่วมชุดตรวจที่ดีที่สุด ({pr['baseline']} MOhm) อยู่ {pr['deviation_pct']}% "
+                    "ซึ่งสูงกว่าค่าความแปรปรวนปกติของเครื่องรุ่นเดียวกันภายใต้เงื่อนไขเดียวกันอย่างมีนัยสำคัญ]"
+                )
+            else:
+                finding["corroboration"] = "threshold_only_unverified"
+                finding["engineering_diagnosis"] = (
+                    finding.get("engineering_diagnosis", "").rstrip()
+                    + " [หมายเหตุ: ยังไม่มีข้อมูลอ้างอิงเฉพาะรุ่นอุปกรณ์นี้ และไม่พบการเบี่ยงเบนจากเครื่องเพื่อนร่วมชุดตรวจอย่างมีนัยสำคัญ "
+                    "ผลประเมินนี้อิงเกณฑ์ทั่วไปเบื้องต้นเท่านั้น แนะนำให้ตรวจสอบหน้างานเพื่อยืนยันก่อนสรุปเป็นข้อบกพร่องที่ยืนยันแล้ว]"
+                )
+
+    return report
+
+
+
 # Not a single-number threshold, so it earns its own function rather than a
 # MEASUREMENT_RULES entry — but it's still fully deterministic (no LLM call).
 

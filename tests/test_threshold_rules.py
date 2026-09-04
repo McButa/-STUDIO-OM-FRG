@@ -5,7 +5,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from core.threshold_rules import apply_measurement_thresholds, derive_plant_totals, detect_cross_source_conflicts
+from core.threshold_rules import apply_measurement_thresholds, apply_peer_comparison, derive_plant_totals, detect_cross_source_conflicts
 from router import _enforce_engineering_rules
 
 
@@ -274,6 +274,63 @@ def test_existing_active_power_value_is_never_overwritten():
     assert report["plant_summary"]["active_power_kw"] == "18.2"
 
 
+# --- Peer comparison integration (corroborate or honestly qualify) ------
+
+def test_global_house_full_batch_gets_corroborated_by_peer_deviation():
+    """Full 6-inverter batch: the WARNING escalation for Inv2-5 should come
+    out CORROBORATED (peer_deviation), because Inv1/Inv6 prove 13-20 MOhm was
+    achievable under the same conditions right now — this is no longer just
+    'a number crossed a generic line', it's a verified anomaly."""
+    report = _report([
+        _finding("Inverter & Monitoring", "Inv_1.jpg", "Insulation resistance: 20.000 MOhm"),
+        _finding("Inverter & Monitoring", "Inv_2.jpg", "Insulation resistance: 0.836 MOhm"),
+        _finding("Inverter & Monitoring", "Inv_3.jpg", "Insulation resistance: 0.867 MOhm"),
+        _finding("Inverter & Monitoring", "Inv_4.jpg", "Insulation resistance: 0.921 MOhm"),
+        _finding("Inverter & Monitoring", "Inv_5.jpg", "Insulation resistance: 0.872 MOhm"),
+        _finding("Inverter & Monitoring", "Inv_6.jpg", "Insulation resistance: 13.541 MOhm"),
+    ])
+    report, locked = apply_measurement_thresholds(report)
+    report = apply_peer_comparison(report)
+    findings_by_file = {f["source_file"]: f for f in report["evidence_findings"]}
+    for f in ["Inv_2.jpg", "Inv_3.jpg", "Inv_4.jpg", "Inv_5.jpg"]:
+        assert findings_by_file[f]["severity"] == "WARNING"
+        assert findings_by_file[f]["corroboration"].startswith("peer_deviation:")
+    assert findings_by_file["Inv_1.jpg"]["severity"] == "NORMAL"
+    assert findings_by_file["Inv_6.jpg"]["severity"] == "NORMAL"
+
+
+def test_single_low_reading_with_no_peers_stays_warning_but_wording_is_honestly_qualified():
+    """This is the exact concern the user raised: without knowing this
+    inverter model's real normal range, and with no peers to compare against,
+    the system must NOT confidently claim 'violates safety standard'. But it
+    also must not silently drop back to NORMAL — that reintroduces the
+    original disaster (a real risk called normal). Severity stays WARNING;
+    only the certainty of the wording changes."""
+    report = _report([
+        _finding("Inverter & Monitoring", "Inv_2.jpg", "Insulation resistance: 0.836 MOhm"),
+    ])
+    report, locked = apply_measurement_thresholds(report)
+    report = apply_peer_comparison(report)
+    finding = report["evidence_findings"][0]
+    assert finding["severity"] == "WARNING"  # never silently downgraded
+    assert finding["corroboration"] == "threshold_only_unverified"
+    assert "ยังไม่มีข้อมูลอ้างอิงเฉพาะรุ่น" in finding["engineering_diagnosis"]
+
+
+def test_peer_comparison_leaves_non_escalated_findings_untouched():
+    report = _report([
+        _finding("Inverter & Monitoring", "Inv_1.jpg", "Insulation resistance: 20.000 MOhm"),
+        _finding("Inverter & Monitoring", "Inv_2.jpg", "Insulation resistance: 19.500 MOhm"),
+        _finding("Inverter & Monitoring", "Inv_3.jpg", "Insulation resistance: 18.900 MOhm"),
+        _finding("Inverter & Monitoring", "Inv_4.jpg", "Insulation resistance: 20.100 MOhm"),
+    ])
+    report, locked = apply_measurement_thresholds(report)
+    report = apply_peer_comparison(report)
+    for f in report["evidence_findings"]:
+        assert f["severity"] == "NORMAL"
+        assert f.get("corroboration") is None
+
+
 # --- Coverage for router's existing hard-coded rules (previously untested) --
 
 def test_zero_grid_current_locks_critical():
@@ -284,6 +341,22 @@ def test_zero_grid_current_locks_critical():
     report, locked = _enforce_engineering_rules(report)
     assert report["plant_summary"]["overall_status"] == "CRITICAL"
     assert locked is True
+
+
+def test_unconfirmed_active_power_and_grid_current_does_not_falsely_lock_critical():
+    """Found during end-to-end verification: coerce_float('UNCONFIRMED') is
+    None, and 'None or 0.0' silently became 0.0 — so a plant where the LLM
+    simply couldn't extract active_power_kw/grid_current_a (not because
+    output is actually zero) was being hard-locked CRITICAL as if it had
+    confirmed zero output. Not knowing the value must never be treated as
+    knowing it's zero."""
+    report = {
+        "plant_summary": {"overall_status": "NORMAL", "active_power_kw": "UNCONFIRMED", "grid_current_a": "UNCONFIRMED", "rated_capacity_kw": "20"},
+        "evidence_findings": [{"observed_data": "ปกติทุกจุด", "engineering_diagnosis": ""}],
+    }
+    report, locked = _enforce_engineering_rules(report)
+    assert report["plant_summary"]["overall_status"] != "CRITICAL"
+    assert locked is False
 
 
 def test_ground_fault_keyword_locks_critical():
