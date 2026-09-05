@@ -2,6 +2,7 @@ import hashlib
 import uuid
 from datetime import datetime, timezone
 
+from core.csv_reader import read_inverter_timeseries_csv
 from core.docx_generator import build_docx
 from core.evidence_validator import coerce_float, validate_evidence_coverage, validate_report
 from core.job_manifest import build_manifest, manifest_summary
@@ -180,11 +181,38 @@ def process_field_report(uploaded_files, api_key: str, plant_name: str = "", lan
     site_context = get_plant_history_context(context_plant, report_type)
     reference_context, references = extract_reference_context(uploaded_files)
     knowledge_context = get_similar_cases_context([context_plant], report_type, context_plant)
-    expected_filenames = [item["filename"] for item in manifest]
+
+    # --- CSV time-series logs are parsed deterministically in Python, not
+    # sent to Gemini at all: a full day of 5-minute readings is exact
+    # arithmetic (uptime, per-string comparison, yield delta), not something
+    # to have an LLM re-derive from raw text at real token cost and with the
+    # same reliability problem this whole system exists to remove. ---
+    csv_indices = [i for i, item in enumerate(manifest) if item["filename"].lower().endswith(".csv")]
+    csv_findings = []
+    for i in csv_indices:
+        file_obj, filename = uploaded_files[i], manifest[i]["filename"]
+        try:
+            raw = file_obj.read()
+            file_obj.seek(0)
+            csv_findings.append(read_inverter_timeseries_csv(raw, filename))
+        except Exception as error:
+            csv_findings.append({
+                "category": "Inverter & Monitoring",
+                "source_file": filename,
+                "observed_data": "ไม่สามารถแปลผลไฟล์ CSV นี้ได้อัตโนมัติ กรุณาตรวจสอบด้วยตนเอง",
+                "severity": "INFORMATIONAL",
+                "engineering_diagnosis": f"รูปแบบไฟล์ไม่ตรงกับที่ตัวแปลผลอัตโนมัติรองรับในขณะนี้: {error}",
+                "key_measurements": [],
+            })
+    non_csv_files = [f for i, f in enumerate(uploaded_files) if i not in csv_indices]
+    expected_filenames = [item["filename"] for i, item in enumerate(manifest) if i not in csv_indices]
+
     report = run_master_analysis_with_coverage_check(
-        lambda: run_extraction(uploaded_files, api_key, site_context, knowledge_context + reference_context, lang=lang, plant_name=context_plant or None),
+        lambda: run_extraction(non_csv_files, api_key, site_context, knowledge_context + reference_context, lang=lang, plant_name=context_plant or None),
         expected_filenames,
     )
+    report.setdefault("evidence_findings", [])
+    report["evidence_findings"].extend(csv_findings)
 
     # --- Stage 2: deterministic engineering analysis (pure code, no LLM) ---
     # Severity is decided ENTIRELY in this block now. run_extraction() above

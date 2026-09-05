@@ -52,7 +52,49 @@ def test_master_report_validates_and_generates_docx():
     assert len(document.getvalue()) > 1000
 
 
-def test_router_makes_one_extraction_and_one_narrative_call(monkeypatch):
+def test_csv_files_are_parsed_deterministically_and_never_sent_to_extraction(monkeypatch):
+    """CSV time-series logs must never reach run_extraction (no Gemini call,
+    no token cost, no LLM judgment) — they're parsed entirely in Python and
+    merged into evidence_findings afterward."""
+    image = io.BytesIO()
+    Image.new("RGB", (20, 20), "white").save(image, format="PNG")
+    csv_content = (
+        "Time range:,2026-09-05 00:00:00 - 2026-09-05 23:59:59,\n"
+        "Export time:,2026-09-05 17:29:12,\n"
+        "Start Time,Active power(kW),Inverter status,Total yield(kWh)\n"
+        "2026-09-05 09:00:00,5.0,Grid connected,50.0\n"
+        "2026-09-05 09:05:00,5.2,Grid connected,50.5\n"
+    ).encode("utf-8")
+    files = [Upload("ABC_STATUS.png", image.getvalue()), Upload("Inverter_LOG_INVERTER-01.csv", csv_content)]
+    extraction_files_seen = []
+
+    def fake_extraction(uploaded_files, *args, **kwargs):
+        extraction_files_seen.extend([f.name for f in uploaded_files])
+        return valid_report()
+
+    def fake_narrative(report, api_key, lang="th"):
+        return {
+            "executive_summary": "Summary.", "root_causes": [],
+            "corrective_actions": [{"step_number": 1, "title": "Verify", "actions": ["Inspect"]}],
+            "spare_parts_tools": [], "inaction_damage_matrix": [],
+        }
+
+    monkeypatch.setattr(router, "run_extraction", fake_extraction)
+    monkeypatch.setattr(router, "run_narrative_writing", fake_narrative)
+    monkeypatch.setattr(router, "get_plant_history_context", lambda *args: "")
+    monkeypatch.setattr(router, "get_similar_cases_context", lambda *args: "")
+    monkeypatch.setattr(router, "extract_reference_context", lambda files: ("", []))
+
+    report, document, report_type, _ = router.process_field_report(files, "key")
+
+    assert "Inverter_LOG_INVERTER-01.csv" not in extraction_files_seen  # never sent to Gemini
+    assert extraction_files_seen == ["ABC_STATUS.png"]
+    csv_finding = [f for f in report["evidence_findings"] if f["source_file"] == "Inverter_LOG_INVERTER-01.csv"]
+    assert len(csv_finding) == 1
+    assert csv_finding[0]["severity"] == "NORMAL"
+
+
+
     """Replaces the old 'exactly one master call' assertion: severity is now
     decided by deterministic code between two LLM calls (extraction, then
     narrative writing) instead of one call doing everything — so the correct

@@ -2,7 +2,7 @@
 set -e
 cd /workspaces/-STUDIO-OM-FRG
 
-mkdir -p core tests engines
+mkdir -p core tests engines tests/fixtures
 
 cat > app.py << 'PYEOF'
 import base64
@@ -363,6 +363,7 @@ import hashlib
 import uuid
 from datetime import datetime, timezone
 
+from core.csv_reader import read_inverter_timeseries_csv
 from core.docx_generator import build_docx
 from core.evidence_validator import coerce_float, validate_evidence_coverage, validate_report
 from core.job_manifest import build_manifest, manifest_summary
@@ -541,11 +542,38 @@ def process_field_report(uploaded_files, api_key: str, plant_name: str = "", lan
     site_context = get_plant_history_context(context_plant, report_type)
     reference_context, references = extract_reference_context(uploaded_files)
     knowledge_context = get_similar_cases_context([context_plant], report_type, context_plant)
-    expected_filenames = [item["filename"] for item in manifest]
+
+    # --- CSV time-series logs are parsed deterministically in Python, not
+    # sent to Gemini at all: a full day of 5-minute readings is exact
+    # arithmetic (uptime, per-string comparison, yield delta), not something
+    # to have an LLM re-derive from raw text at real token cost and with the
+    # same reliability problem this whole system exists to remove. ---
+    csv_indices = [i for i, item in enumerate(manifest) if item["filename"].lower().endswith(".csv")]
+    csv_findings = []
+    for i in csv_indices:
+        file_obj, filename = uploaded_files[i], manifest[i]["filename"]
+        try:
+            raw = file_obj.read()
+            file_obj.seek(0)
+            csv_findings.append(read_inverter_timeseries_csv(raw, filename))
+        except Exception as error:
+            csv_findings.append({
+                "category": "Inverter & Monitoring",
+                "source_file": filename,
+                "observed_data": "ไม่สามารถแปลผลไฟล์ CSV นี้ได้อัตโนมัติ กรุณาตรวจสอบด้วยตนเอง",
+                "severity": "INFORMATIONAL",
+                "engineering_diagnosis": f"รูปแบบไฟล์ไม่ตรงกับที่ตัวแปลผลอัตโนมัติรองรับในขณะนี้: {error}",
+                "key_measurements": [],
+            })
+    non_csv_files = [f for i, f in enumerate(uploaded_files) if i not in csv_indices]
+    expected_filenames = [item["filename"] for i, item in enumerate(manifest) if i not in csv_indices]
+
     report = run_master_analysis_with_coverage_check(
-        lambda: run_extraction(uploaded_files, api_key, site_context, knowledge_context + reference_context, lang=lang, plant_name=context_plant or None),
+        lambda: run_extraction(non_csv_files, api_key, site_context, knowledge_context + reference_context, lang=lang, plant_name=context_plant or None),
         expected_filenames,
     )
+    report.setdefault("evidence_findings", [])
+    report["evidence_findings"].extend(csv_findings)
 
     # --- Stage 2: deterministic engineering analysis (pure code, no LLM) ---
     # Severity is decided ENTIRELY in this block now. run_extraction() above
@@ -1459,6 +1487,254 @@ def compare_to_peers(readings: list, bad_direction: str, relative_threshold_pct:
             "is_outlier": deviation_pct >= relative_threshold_pct,
         })
     return results
+
+PYEOF
+
+cat > core/csv_reader.py << 'PYEOF'
+"""
+Time-series inverter/logger CSV reader.
+
+Why this file exists: an inverter data-log export (e.g. a Huawei/FusionSolar
+style "Inverter_..._INVERTER-01_....csv") is a full day of 5-minute-interval
+readings — commonly 200-300 rows x 30+ columns. Sending that as raw text to
+an LLM would be expensive AND would reintroduce exactly the "same input,
+different answer" unreliability this whole system exists to eliminate for a
+domain (arithmetic over a table) that Python does exactly and for free. So
+this file does ALL the actual computation — min/max/mean, uptime/downtime,
+per-string comparison — in plain Python, and produces a ready-made
+evidence_finding with a human-readable Thai summary + structured
+key_measurements. No Gemini call is needed for this file type at all.
+
+Column layouts differ by logger brand/export settings ("บางทีแต่ละทีมีข้างใน
+ไม่เหมือนกัน" — the exact concern this module is built to survive), so nothing
+here assumes a fixed row number for the header or a fixed column order —
+only that certain columns can be recognized by keyword in their names.
+"""
+
+import csv
+import io
+import re
+import statistics
+from datetime import datetime
+
+from core.peer_comparison import compare_to_peers
+from core.threshold_rules import _higher
+
+# Keyword patterns used to recognize a column regardless of exact wording/
+# unit formatting, since exports vary ("Active power(kW)" vs "Active Power
+# (kW)" vs "有功功率(kW)", etc. — we match on the English keyword substrings
+# actually seen across common exports; a column that matches none of these
+# is simply not summarized, not guessed at).
+_COLUMN_PATTERNS = {
+    "timestamp": re.compile(r"start time|^time$|timestamp", re.IGNORECASE),
+    "active_power": re.compile(r"active power", re.IGNORECASE),
+    "status": re.compile(r"inverter status|^status$", re.IGNORECASE),
+    "internal_temp": re.compile(r"internal temperature", re.IGNORECASE),
+    "total_yield": re.compile(r"total yield", re.IGNORECASE),
+    "grid_current": re.compile(r"grid current", re.IGNORECASE),
+}
+_PV_STRING_CURRENT = re.compile(r"pv\s*(\d+)\s*input current", re.IGNORECASE)
+
+# Status text is free-form ("OFF : instructed shutdown", "Standby :  no
+# sunlight", "Grid connected", "Grid connected : self derating") — bucket by
+# keyword rather than exact string match, since wording varies by brand/fw.
+_STATUS_BUCKETS = [
+    ("off_commanded", re.compile(r"\boff\b.*shutdown|instructed shutdown", re.IGNORECASE)),
+    ("standby_no_sun", re.compile(r"standby.*(no sun|no light)", re.IGNORECASE)),
+    ("fault_alarm", re.compile(r"fault|alarm|error|trip", re.IGNORECASE)),
+    ("derating", re.compile(r"derat", re.IGNORECASE)),
+    ("producing", re.compile(r"grid connected", re.IGNORECASE)),
+]
+
+
+def _bucket_status(text: str) -> str:
+    for bucket, pattern in _STATUS_BUCKETS:
+        if pattern.search(text):
+            return bucket
+    return "other"
+
+
+def _sniff_header_row(rows: list) -> int:
+    """Find the real header row among leading metadata lines (export
+    timestamps, legend text, etc.) by looking for a row that names actual
+    measurement columns, rather than assuming a fixed row number."""
+    for i, row in enumerate(rows[:30]):
+        joined = ",".join(row).lower()
+        if ("time" in joined) and any(k in joined for k in ("power", "voltage", "current", "yield", "temperature")):
+            return i
+    raise ValueError("ไม่พบแถวหัวตาราง (header) ที่จดจำได้ในไฟล์ CSV นี้ — รูปแบบไฟล์อาจไม่ตรงกับที่รองรับไว้")
+
+
+def _to_float(value):
+    if value is None:
+        return None
+    try:
+        cleaned = value.strip()
+        if not cleaned or cleaned.upper() in ("N/A", "-", "NA"):
+            return None
+        return float(cleaned)
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def _parse_timestamp(value: str):
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S"):
+        try:
+            return datetime.strptime(value.strip(), fmt)
+        except (ValueError, AttributeError):
+            continue
+    return None
+
+
+def read_inverter_timeseries_csv(raw_bytes: bytes, source_file: str) -> dict:
+    """Parse one inverter's day-log CSV and return a ready-made
+    evidence_finding dict (category, source_file, observed_data,
+    key_measurements). Raises ValueError with a Thai message if the file
+    doesn't look like a recognizable inverter log at all — the caller
+    should surface that as an UNCONFIRMED/needs-review note rather than
+    silently dropping the file."""
+    text = raw_bytes.decode("utf-8-sig", errors="ignore")
+    all_rows = list(csv.reader(io.StringIO(text)))
+    if not all_rows:
+        raise ValueError("ไฟล์ CSV ว่างเปล่าหรืออ่านไม่ได้")
+
+    header_idx = _sniff_header_row(all_rows)
+    header = [h.strip() for h in all_rows[header_idx]]
+    data_rows = [r for r in all_rows[header_idx + 1:] if any(cell.strip() for cell in r)]
+
+    col_index = {}
+    pv_string_cols = {}  # string number -> column index
+    for i, name in enumerate(header):
+        for key, pattern in _COLUMN_PATTERNS.items():
+            if key not in col_index and pattern.search(name):
+                col_index[key] = i
+        pv_match = _PV_STRING_CURRENT.search(name)
+        if pv_match:
+            pv_string_cols[int(pv_match.group(1))] = i
+
+    if "timestamp" not in col_index or not data_rows:
+        raise ValueError("ไม่พบคอลัมน์เวลา หรือไม่มีข้อมูลแถวใดเลยในไฟล์ CSV นี้")
+
+    def col(row, key):
+        idx = col_index.get(key)
+        return row[idx].strip() if idx is not None and idx < len(row) else None
+
+    timestamps = [_parse_timestamp(col(r, "timestamp")) for r in data_rows]
+    valid_rows = [(ts, r) for ts, r in zip(timestamps, data_rows) if ts is not None]
+    if not valid_rows:
+        raise ValueError("อ่านค่าเวลาจากไฟล์ CSV นี้ไม่ได้แม้แต่แถวเดียว")
+    valid_rows.sort(key=lambda pair: pair[0])
+    start_ts, _ = valid_rows[0]
+    end_ts, _ = valid_rows[-1]
+
+    # --- Active power stats ---
+    active_power_values = [v for _, r in valid_rows if (v := _to_float(col(r, "active_power"))) is not None]
+    peak_active_power = max(active_power_values) if active_power_values else None
+
+    # --- Status time breakdown (bucketed) ---
+    interval_minutes = None
+    if len(valid_rows) >= 2:
+        deltas = [(valid_rows[i][0] - valid_rows[i - 1][0]).total_seconds() / 60 for i in range(1, len(valid_rows))]
+        interval_minutes = statistics.median(deltas)
+    status_minutes = {}
+    if "status" in col_index and interval_minutes:
+        for _, r in valid_rows:
+            raw_status = col(r, "status") or ""
+            bucket = _bucket_status(raw_status)
+            status_minutes[bucket] = status_minutes.get(bucket, 0) + interval_minutes
+
+    # --- Total yield delta (cumulative counter) ---
+    yield_values = [v for _, r in valid_rows if (v := _to_float(col(r, "total_yield"))) is not None]
+    yield_delta = None
+    if len(yield_values) >= 2:
+        first_y, last_y = yield_values[0], yield_values[-1]
+        if last_y >= first_y:
+            yield_delta = round(last_y - first_y, 3)
+        # if the counter went DOWN, it likely reset mid-window — don't
+        # report a fabricated negative "production" figure
+
+    # --- Internal temperature ---
+    temp_values = [v for _, r in valid_rows if (v := _to_float(col(r, "internal_temp"))) is not None]
+    temp_max = max(temp_values) if temp_values else None
+    temp_min = min(temp_values) if temp_values else None
+
+    # --- Per-PV-string peak current, peer-compared to find a dead/weak string ---
+    string_peaks = {}
+    for string_no, idx in pv_string_cols.items():
+        values = [v for _, r in valid_rows if idx < len(r) and (v := _to_float(r[idx])) is not None]
+        if values:
+            string_peaks[string_no] = max(values)
+    string_peer_results = compare_to_peers(
+        [{"id": sn, "value": v} for sn, v in string_peaks.items()],
+        bad_direction="low",
+    )
+    weak_strings = [r for r in string_peer_results if r["is_outlier"]]
+
+    # --- Build human-readable summary (Thai) ---
+    lines = []
+    lines.append(
+        f"ข้อมูล time-series จาก {start_ts.strftime('%Y-%m-%d %H:%M')} ถึง {end_ts.strftime('%Y-%m-%d %H:%M')} "
+        f"({len(valid_rows)} จุดข้อมูล)"
+    )
+    if peak_active_power is not None:
+        lines.append(f"กำลังผลิตสูงสุดที่บันทึกได้ในช่วงนี้: {peak_active_power} kW")
+    if yield_delta is not None:
+        lines.append(f"พลังงานที่ผลิตได้สะสมในช่วงนี้ (Total yield delta): {yield_delta} kWh")
+    if temp_max is not None:
+        lines.append(f"อุณหภูมิภายในเครื่อง: ต่ำสุด {temp_min}°C สูงสุด {temp_max}°C")
+    if status_minutes:
+        readable = ", ".join(f"{k}: {round(v)} นาที" for k, v in sorted(status_minutes.items(), key=lambda kv: -kv[1]))
+        lines.append(f"สถานะเครื่องแยกตามช่วงเวลา: {readable}")
+        off_commanded = status_minutes.get("off_commanded", 0)
+        if off_commanded >= 180:  # 3+ hours of commanded-off is worth a human's attention
+            hh, mm = divmod(round(off_commanded), 60)
+            lines.append(
+                f"หมายเหตุ: เครื่องอยู่ในสถานะ 'OFF : instructed shutdown' (ปิดโดยคำสั่ง ไม่ใช่ปิดเพราะไม่มีแดด) "
+                f"ยาวนาน {hh} ชั่วโมง {mm} นาที ในช่วงเวลานี้ — ควรตรวจสอบว่าเป็นการปิดเพื่อบำรุงรักษาตามแผน "
+                "หรือมีคนลืมเปิดเครื่องกลับ"
+            )
+    if weak_strings:
+        weak_ids = ", ".join(f"PV{r['id']}" for r in weak_strings)
+        best = max(string_peaks.values()) if string_peaks else None
+        lines.append(
+            f"หมายเหตุ: กระแสสูงสุดของสตริง {weak_ids} ต่ำกว่าสตริงที่ดีที่สุดในชุดเดียวกัน (สูงสุด {best} A) "
+            "อย่างมีนัยสำคัญ ควรตรวจสอบสตริงนี้ (แผงบังแดด/สายหลุด/ฟิวส์ขาด)"
+        )
+
+    key_measurements = []
+    if peak_active_power is not None:
+        key_measurements.append({"parameter": "active_power_kw_peak", "value": peak_active_power, "unit": "kW", "comparator": "="})
+    if yield_delta is not None:
+        key_measurements.append({"parameter": "daily_energy_kwh_delta", "value": yield_delta, "unit": "kWh", "comparator": "="})
+    if temp_max is not None:
+        key_measurements.append({"parameter": "internal_temp_c_max", "value": temp_max, "unit": "C", "comparator": "="})
+    if status_minutes.get("off_commanded"):
+        key_measurements.append({"parameter": "off_commanded_minutes", "value": round(status_minutes["off_commanded"]), "unit": "min", "comparator": "="})
+
+    # Severity is decided right here, in code — this whole finding is
+    # already 100% computed, there's no LLM judgment step for it to pass
+    # through. A weak-string proportion >= 30% of the array materially
+    # impairs production (not just one bad apple), so it's CRITICAL rather
+    # than WARNING; a smaller proportion, or just extended off-time, is
+    # WARNING (worth a human's attention, not yet a confirmed major loss).
+    severity = "NORMAL"
+    if weak_strings and string_peaks:
+        weak_fraction = len(weak_strings) / len(string_peaks)
+        severity = _higher(severity, "CRITICAL" if weak_fraction >= 0.3 else "WARNING")
+    if status_minutes.get("off_commanded", 0) >= 180:
+        severity = _higher(severity, "WARNING")
+
+    return {
+        "category": "Inverter & Monitoring",
+        "source_file": source_file,
+        "observed_data": " ".join(lines),
+        "severity": severity,
+        "engineering_diagnosis": (
+            f"[คำนวณจากไฟล์ CSV โดยตรง: พบสตริง {len(weak_strings)} จาก {len(string_peaks)} สตริง ที่กระแสสูงสุดต่ำกว่าสตริงที่ดีที่สุดอย่างมีนัยสำคัญ]"
+            if weak_strings else ""
+        ),
+        "key_measurements": key_measurements,
+    }
 
 PYEOF
 
@@ -2445,7 +2721,49 @@ def test_master_report_validates_and_generates_docx():
     assert len(document.getvalue()) > 1000
 
 
-def test_router_makes_one_extraction_and_one_narrative_call(monkeypatch):
+def test_csv_files_are_parsed_deterministically_and_never_sent_to_extraction(monkeypatch):
+    """CSV time-series logs must never reach run_extraction (no Gemini call,
+    no token cost, no LLM judgment) — they're parsed entirely in Python and
+    merged into evidence_findings afterward."""
+    image = io.BytesIO()
+    Image.new("RGB", (20, 20), "white").save(image, format="PNG")
+    csv_content = (
+        "Time range:,2026-09-05 00:00:00 - 2026-09-05 23:59:59,\n"
+        "Export time:,2026-09-05 17:29:12,\n"
+        "Start Time,Active power(kW),Inverter status,Total yield(kWh)\n"
+        "2026-09-05 09:00:00,5.0,Grid connected,50.0\n"
+        "2026-09-05 09:05:00,5.2,Grid connected,50.5\n"
+    ).encode("utf-8")
+    files = [Upload("ABC_STATUS.png", image.getvalue()), Upload("Inverter_LOG_INVERTER-01.csv", csv_content)]
+    extraction_files_seen = []
+
+    def fake_extraction(uploaded_files, *args, **kwargs):
+        extraction_files_seen.extend([f.name for f in uploaded_files])
+        return valid_report()
+
+    def fake_narrative(report, api_key, lang="th"):
+        return {
+            "executive_summary": "Summary.", "root_causes": [],
+            "corrective_actions": [{"step_number": 1, "title": "Verify", "actions": ["Inspect"]}],
+            "spare_parts_tools": [], "inaction_damage_matrix": [],
+        }
+
+    monkeypatch.setattr(router, "run_extraction", fake_extraction)
+    monkeypatch.setattr(router, "run_narrative_writing", fake_narrative)
+    monkeypatch.setattr(router, "get_plant_history_context", lambda *args: "")
+    monkeypatch.setattr(router, "get_similar_cases_context", lambda *args: "")
+    monkeypatch.setattr(router, "extract_reference_context", lambda files: ("", []))
+
+    report, document, report_type, _ = router.process_field_report(files, "key")
+
+    assert "Inverter_LOG_INVERTER-01.csv" not in extraction_files_seen  # never sent to Gemini
+    assert extraction_files_seen == ["ABC_STATUS.png"]
+    csv_finding = [f for f in report["evidence_findings"] if f["source_file"] == "Inverter_LOG_INVERTER-01.csv"]
+    assert len(csv_finding) == 1
+    assert csv_finding[0]["severity"] == "NORMAL"
+
+
+
     """Replaces the old 'exactly one master call' assertion: severity is now
     decided by deterministic code between two LLM calls (extraction, then
     narrative writing) instead of one call doing everything — so the correct
@@ -2530,6 +2848,342 @@ def test_historical_memory_loads_audit_and_report(tmp_path, monkeypatch):
 
 PYEOF
 
+cat > tests/test_csv_reader.py << 'PYEOF'
+import io
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from core.csv_reader import read_inverter_timeseries_csv
+
+FIXTURE = ROOT / "tests" / "fixtures" / "inverter_log_sample.csv"
+
+
+def _build_csv(header, rows):
+    lines = [
+        "Time range:,2026-09-05 00:00:00 - 2026-09-05 23:59:59,",
+        "Export time:,2026-09-05 17:29:12,",
+        ",".join(header),
+    ]
+    for r in rows:
+        lines.append(",".join(str(v) for v in r))
+    return ("\n".join(lines)).encode("utf-8")
+
+
+# --- Golden test against the real, hand-verified file --------------------
+
+def test_real_sample_file_finds_the_five_dead_strings():
+    """Independently verified by hand: PV2, PV5, PV7, PV8, PV11 read exactly
+    0.0 A across the entire day while PV1/3/4/6/9/10 reach ~22 A. This is a
+    real production-impairing fault (5 of 11 strings dead), not a synthetic
+    test case."""
+    raw = FIXTURE.read_bytes()
+    result = read_inverter_timeseries_csv(raw, FIXTURE.name)
+    assert result["severity"] == "CRITICAL"  # 5/11 = 45% >= 30% threshold
+    for label in ("PV2", "PV5", "PV7", "PV8", "PV11"):
+        assert label in result["observed_data"]
+    assert result["category"] == "Inverter & Monitoring"
+
+
+def test_real_sample_file_flags_extended_commanded_shutdown():
+    raw = FIXTURE.read_bytes()
+    result = read_inverter_timeseries_csv(raw, FIXTURE.name)
+    assert "instructed shutdown" in result["observed_data"]
+    assert any(m["parameter"] == "off_commanded_minutes" and m["value"] >= 180 for m in result["key_measurements"])
+
+
+def test_real_sample_file_computes_correct_yield_delta():
+    # First row Total yield = 51.41, last row = 429.75 -> delta 378.34
+    raw = FIXTURE.read_bytes()
+    result = read_inverter_timeseries_csv(raw, FIXTURE.name)
+    delta = [m["value"] for m in result["key_measurements"] if m["parameter"] == "daily_energy_kwh_delta"][0]
+    assert delta == 378.34
+
+
+# --- Synthetic tests for edge cases and format robustness -----------------
+
+def test_all_strings_healthy_gives_normal_severity():
+    header = ["Start Time", "Active power(kW)", "Inverter status", "Internal temperature(°C)",
+              "PV1 input current(A)", "PV2 input current(A)", "Total yield(kWh)"]
+    rows = [
+        ["2026-09-05 08:00:00", "10.0", "Grid connected", "45.0", "10.0", "10.2", "100.0"],
+        ["2026-09-05 08:05:00", "10.5", "Grid connected", "45.2", "10.1", "10.1", "100.9"],
+        ["2026-09-05 08:10:00", "11.0", "Grid connected", "45.5", "10.2", "10.3", "101.8"],
+        ["2026-09-05 08:15:00", "11.2", "Grid connected", "45.6", "10.3", "10.2", "102.7"],
+    ]
+    result = read_inverter_timeseries_csv(_build_csv(header, rows), "healthy.csv")
+    assert result["severity"] == "NORMAL"
+    assert "หมายเหตุ" not in result["observed_data"]
+
+
+def test_different_column_order_and_wording_still_parses():
+    """Different logger export: columns in a different order, different
+    header capitalization — nothing here should assume a fixed layout."""
+    header = ["Inverter Status", "PV1 Input Current(A)", "Start Time", "active power(kw)", "total yield(kwh)"]
+    rows = [
+        ["Grid connected", "15.0", "2026-09-05 09:00:00", "5.0", "50.0"],
+        ["Grid connected", "15.2", "2026-09-05 09:05:00", "5.1", "50.5"],
+        ["Grid connected", "15.1", "2026-09-05 09:10:00", "5.2", "51.0"],
+        ["Grid connected", "15.3", "2026-09-05 09:15:00", "5.3", "51.5"],
+    ]
+    result = read_inverter_timeseries_csv(_build_csv(header, rows), "different_layout.csv")
+    assert result["severity"] == "NORMAL"
+    assert any(m["parameter"] == "daily_energy_kwh_delta" for m in result["key_measurements"])
+
+
+def test_yield_counter_reset_does_not_report_fabricated_negative():
+    header = ["Start Time", "Total yield(kWh)"]
+    rows = [
+        ["2026-09-05 08:00:00", "500.0"],
+        ["2026-09-05 08:05:00", "0.5"],  # counter reset mid-window
+    ]
+    result = read_inverter_timeseries_csv(_build_csv(header, rows), "reset.csv")
+    assert not any(m["parameter"] == "daily_energy_kwh_delta" for m in result["key_measurements"])
+
+
+def test_unrecognizable_file_raises_value_error():
+    garbage = b"this,is,not,an,inverter,log\n1,2,3,4,5,6"
+    try:
+        read_inverter_timeseries_csv(garbage, "garbage.csv")
+        assert False, "should have raised"
+    except ValueError:
+        pass
+
+
+def test_three_of_eleven_strings_weak_is_warning_not_critical():
+    # 3/11 = 27% < 30% threshold -> WARNING, not CRITICAL
+    header = ["Start Time"] + [f"PV{i} input current(A)" for i in range(1, 12)]
+    healthy = ["20.0"] * 8
+    weak = ["0.0"] * 3
+    row = ["2026-09-05 09:00:00"] + healthy + weak
+    row2 = ["2026-09-05 09:05:00"] + healthy + weak
+    result = read_inverter_timeseries_csv(_build_csv(header, [row, row2]), "partial.csv")
+    assert result["severity"] == "WARNING"
+
+PYEOF
+
+cat > tests/fixtures/inverter_log_sample.csv << 'PYEOF'
+﻿Time range:,2026-09-05 00:00:00 - 2026-09-05 23:59:59,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,
+Export time:,2026-09-05 17:29:12,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,
+"""N/A"": Not available/Some counters are not recorded when the device is disconnected
+""-"": This counter is not supported by the device.
+Content in gray italics: This is the supplementary data and is for reference only.",,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,
+Site Name,Management Domain,ManageObject,Start Time,Active power(kW),Grid current/Grid phase A current(A),Internal temperature(℃),Inverter shutdown time,Inverter status,Phase A voltage(V),Phase B current(A),Phase B voltage(V),Phase C current(A),Phase C voltage(V),PV1 input current(A),PV1 input voltage(V),PV2 input current(A),PV2 input voltage(V),PV3 input current(A),PV3 input voltage(V),PV4 input current(A),PV4 input voltage(V),PV5 input current(A),PV5 input voltage(V),PV6 input current(A),PV6 input voltage(V),PV7 input current(A),PV7 input voltage(V),PV8 input current(A),PV8 input voltage(V),PV9 input current(A),PV9 input voltage(V),PV10 input current(A),PV10 input voltage(V),PV11 input current(A),PV11 input voltage(V),Total yield(kWh)
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 00:00:00,0.000,0.000,37.6,N/A,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 00:05:00,0.000,0.000,37.6,N/A,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 00:10:00,0.000,0.000,37.5,N/A,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 00:15:00,0.000,0.000,37.5,N/A,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 00:20:00,0.000,0.000,37.5,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 00:25:00,0.000,0.000,37.4,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 00:30:00,0.000,0.000,37.4,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 00:35:00,0.000,0.000,37.4,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 00:40:00,0.000,0.000,37.4,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 00:45:00,0.000,0.000,37.3,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 00:50:00,0.000,0.000,37.3,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 00:55:00,0.000,0.000,37.3,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 01:00:00,0.000,0.000,37.3,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 01:05:00,0.000,0.000,37.2,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 01:10:00,0.000,0.000,37.2,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 01:15:00,0.000,0.000,37.2,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 01:20:00,0.000,0.000,37.2,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 01:25:00,0.000,0.000,37.1,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 01:30:00,0.000,0.000,37.1,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 01:35:00,0.000,0.000,37.1,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 01:40:00,0.000,0.000,37.1,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 01:45:00,0.000,0.000,37.1,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 01:50:00,0.000,0.000,37.0,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 01:55:00,0.000,0.000,37.0,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 02:00:00,0.000,0.000,37.0,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 02:05:00,0.000,0.000,36.9,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 02:10:00,0.000,0.000,36.9,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 02:15:00,0.000,0.000,36.8,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 02:20:00,0.000,0.000,36.8,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 02:25:00,0.000,0.000,36.7,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 02:30:00,0.000,0.000,36.7,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 02:35:00,0.000,0.000,36.7,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 02:40:00,0.000,0.000,36.7,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 02:45:00,0.000,0.000,36.6,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 02:50:00,0.000,0.000,36.6,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 02:55:00,0.000,0.000,36.6,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 03:00:00,0.000,0.000,36.5,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 03:05:00,0.000,0.000,36.5,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 03:10:00,0.000,0.000,36.5,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 03:15:00,0.000,0.000,36.5,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 03:20:00,0.000,0.000,36.4,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 03:25:00,0.000,0.000,36.4,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 03:30:00,0.000,0.000,36.3,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 03:35:00,0.000,0.000,36.3,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 03:40:00,0.000,0.000,36.3,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 03:45:00,0.000,0.000,36.3,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 03:50:00,0.000,0.000,36.3,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 03:55:00,0.000,0.000,36.2,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 04:00:00,0.000,0.000,36.2,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 04:05:00,0.000,0.000,36.2,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 04:10:00,0.000,0.000,36.2,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 04:15:00,0.000,0.000,36.1,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 04:20:00,0.000,0.000,36.1,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 04:25:00,0.000,0.000,36.0,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 04:30:00,0.000,0.000,36.0,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 04:35:00,0.000,0.000,36.0,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 04:40:00,0.000,0.000,36.0,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 04:45:00,0.000,0.000,36.0,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 04:50:00,0.000,0.000,36.0,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 04:55:00,0.000,0.000,35.9,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 05:00:00,0.000,0.000,35.9,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 05:05:00,0.000,0.000,35.9,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 05:10:00,0.000,0.000,35.9,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 05:15:00,0.000,0.000,35.9,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 05:20:00,0.000,0.000,35.8,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 05:25:00,0.000,0.000,35.8,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 05:30:00,0.000,0.000,35.8,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 05:35:00,0.000,0.000,35.8,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 05:40:00,0.000,0.000,35.8,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 05:45:00,0.000,0.000,35.7,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 05:50:00,0.000,0.000,35.7,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 05:55:00,0.000,0.000,35.7,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 06:00:00,0.000,0.000,35.6,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 06:05:00,0.000,0.000,35.6,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 06:10:00,0.000,0.000,35.6,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 06:15:00,0.000,0.000,35.5,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 06:20:00,0.000,0.000,35.5,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 06:25:00,0.000,0.000,35.5,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 06:30:00,0.000,0.000,35.5,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 06:35:00,0.000,0.000,35.5,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 06:40:00,0.000,0.000,35.4,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 06:45:00,0.000,0.000,35.4,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 06:50:00,0.000,0.000,35.4,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 06:55:00,0.000,0.000,35.4,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 07:00:00,0.000,0.000,35.4,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 07:05:00,0.000,0.000,35.4,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 07:10:00,0.000,0.000,35.3,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 07:15:00,0.000,0.000,35.4,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 07:20:00,0.000,0.000,35.3,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 07:25:00,0.000,0.000,35.3,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 07:30:00,0.000,0.000,35.3,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 07:35:00,0.000,0.000,35.3,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 07:40:00,0.000,0.000,35.3,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 07:45:00,0.000,0.000,35.3,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 07:50:00,0.000,0.000,35.3,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 07:55:00,0.000,0.000,35.3,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 08:00:00,0.000,0.000,35.3,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 08:05:00,0.000,0.000,35.3,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 08:10:00,0.000,0.000,35.3,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 08:15:00,0.000,0.000,35.4,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 08:20:00,0.000,0.000,35.4,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 08:25:00,0.000,0.000,35.3,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 08:30:00,0.000,0.000,35.4,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 08:35:00,0.000,0.000,35.4,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 08:40:00,0.000,0.000,35.4,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 08:45:00,0.000,0.000,35.4,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 08:50:00,0.000,0.000,35.4,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 08:55:00,0.000,0.000,35.4,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 09:00:00,0.000,0.000,35.5,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 09:05:00,0.000,0.000,35.5,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 09:10:00,0.000,0.000,35.6,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 09:15:00,0.000,0.000,35.6,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 09:20:00,0.000,0.000,35.6,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 09:25:00,0.000,0.000,35.7,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 09:30:00,0.000,0.000,35.7,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 09:35:00,0.000,0.000,35.8,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 09:40:00,0.000,0.000,35.8,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 09:45:00,0.000,0.000,35.9,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 09:50:00,0.000,0.000,35.9,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 09:55:00,0.000,0.000,36.0,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 10:00:00,0.000,0.000,36.0,2026/09/02 15:36:36,OFF : instructed shutdown,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,51.41
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 10:05:00,110.201,157.252,35.3,2026/09/02 15:36:36,Grid connected,232.1,156.803,236.0,156.616,234.4,14.76,698.9,0.00,698.9,14.83,698.9,14.65,694.9,0.00,694.9,14.85,694.9,0.00,726.9,0.00,726.9,14.03,726.9,14.47,701.3,0.00,701.3,51.95
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 10:10:00,165.000,234.712,41.5,2026/09/02 15:36:36,Grid connected,232.1,233.894,237.0,233.698,235.4,19.96,757.1,0.00,757.1,20.51,757.1,20.23,755.6,0.00,755.6,20.08,755.6,0.00,730.7,0.00,730.7,21.57,730.7,21.74,726.7,0.00,726.7,64.50
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 10:15:00,130.615,186.813,48.9,2026/09/02 15:36:36,Grid connected,231.1,186.188,236.0,186.135,234.4,16.57,731.9,0.00,731.9,16.76,731.9,16.48,733.6,0.00,733.6,16.69,733.6,0.00,726.4,0.00,726.4,16.69,726.4,16.61,730.7,0.00,730.7,76.97
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 10:20:00,113.829,163.077,50.4,2026/09/02 15:36:36,Grid connected,231.0,162.552,235.9,162.521,233.9,14.79,726.6,0.00,726.6,14.85,726.6,14.61,725.2,0.00,725.2,14.76,725.2,0.00,734.8,0.00,734.8,14.36,734.8,14.32,734.5,0.00,734.5,84.15
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 10:25:00,89.575,128.577,52.0,2026/09/02 15:36:36,Grid connected,231.0,128.131,234.8,128.170,233.9,11.27,736.6,0.00,736.6,11.37,736.6,11.19,738.8,0.00,738.8,11.34,738.8,0.00,742.8,0.00,742.8,11.15,742.8,11.25,736.0,0.00,736.0,92.59
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 10:30:00,93.361,134.122,52.8,2026/09/02 15:36:36,Grid connected,231.0,133.695,234.8,133.679,233.9,11.62,744.5,0.00,744.5,11.75,744.5,11.61,743.6,0.00,743.6,11.78,743.6,0.00,746.8,0.00,746.8,11.58,746.8,11.60,745.0,0.00,745.0,100.33
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 10:35:00,112.757,162.226,54.0,2026/09/02 15:36:36,Grid connected,231.0,161.700,234.8,161.688,233.9,14.11,733.2,0.00,733.2,14.29,733.2,14.07,738.4,0.00,738.4,14.31,738.4,0.00,741.2,0.00,741.2,14.13,741.2,14.21,740.3,0.00,740.3,109.16
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 10:40:00,93.879,135.217,54.8,2026/09/02 15:36:36,Grid connected,230.0,134.734,233.8,134.776,232.9,11.74,736.7,0.00,736.7,11.88,736.7,11.67,741.3,0.00,741.3,11.83,741.3,0.00,741.3,0.00,741.3,11.70,741.3,11.77,737.9,0.00,737.9,117.27
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 10:45:00,110.054,158.303,55.8,2026/09/02 15:36:36,Grid connected,231.0,157.757,234.9,157.780,233.9,13.77,741.2,0.00,741.2,13.96,741.2,14.09,723.5,0.00,723.5,14.29,723.5,0.00,736.0,0.00,736.0,13.88,736.0,13.90,736.3,0.00,736.3,125.69
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 10:50:00,164.996,236.198,60.0,2026/09/02 15:36:36,Grid connected,231.0,235.323,236.0,235.150,233.9,20.35,741.4,0.00,741.4,20.73,741.4,20.36,745.8,0.00,745.8,20.52,745.8,0.00,730.6,0.00,730.6,21.59,730.6,21.84,715.1,0.00,715.1,137.92
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 10:55:00,125.522,180.487,63.2,2026/09/02 15:36:36,Grid connected,231.0,179.824,234.9,179.788,233.8,16.39,719.9,0.00,719.9,16.50,719.9,16.39,714.0,0.00,714.0,16.52,714.0,0.00,716.9,0.00,716.9,16.22,716.9,16.14,717.5,0.00,717.5,150.12
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 11:00:00,103.712,150.058,62.7,2026/09/02 15:36:36,Grid connected,228.7,149.779,233.3,149.572,231.6,13.71,720.8,0.00,720.8,13.85,720.8,13.80,711.1,0.00,711.1,13.79,711.1,0.00,708.9,0.00,708.9,13.47,708.9,13.03,724.2,0.00,724.2,159.64
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 11:05:00,147.967,213.616,63.0,2026/09/02 15:36:36,Grid connected,228.7,212.941,234.3,212.728,232.6,19.11,722.3,0.00,722.3,19.35,722.3,19.17,723.8,0.00,723.8,19.32,723.8,0.00,716.2,0.00,716.2,19.35,716.2,18.90,728.7,0.00,728.7,169.36
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 11:10:00,164.299,236.858,66.5,2026/09/02 15:36:36,Grid connected,228.7,236.073,234.3,235.578,232.6,20.02,764.2,0.00,764.2,20.77,764.2,20.38,763.4,0.00,763.4,19.65,763.4,0.00,699.5,0.00,699.5,21.73,699.5,21.80,705.2,0.00,705.2,182.46
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 11:15:00,159.156,229.658,71.8,2026/09/02 15:36:36,Grid connected,228.7,229.010,234.3,228.604,232.6,19.35,759.2,0.00,759.2,20.33,759.2,19.73,759.5,0.00,759.5,18.92,759.5,0.00,697.9,0.00,697.9,21.84,697.9,21.88,705.2,0.00,705.2,196.05
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 11:20:00,143.410,207.349,73.6,2026/09/02 15:36:36,Grid connected,228.7,206.784,234.3,206.474,232.6,15.46,781.9,0.00,781.9,16.80,781.9,16.58,779.5,0.00,779.5,15.37,779.5,0.00,737.2,0.00,737.2,21.80,737.2,21.84,733.0,0.00,733.0,208.50
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 11:25:00,107.596,155.820,73.3,2026/09/02 15:36:36,Grid connected,228.7,155.431,233.2,155.297,231.6,18.32,703.6,0.00,703.6,16.63,703.6,15.08,707.9,0.00,707.9,14.00,707.9,0.00,705.2,0.00,705.2,13.19,705.2,12.82,713.0,0.00,713.0,219.05
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 11:30:00,112.745,163.110,74.0,2026/09/02 15:36:36,Grid connected,228.7,162.563,234.2,162.469,232.6,14.78,706.3,0.00,706.3,15.05,706.3,14.97,701.2,0.00,701.2,15.09,701.2,0.00,705.2,0.00,705.2,14.93,705.2,15.06,700.1,0.00,700.1,230.73
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 11:35:00,144.657,208.749,73.4,2026/09/02 15:36:36,Grid connected,228.7,208.047,234.2,207.849,232.6,16.62,782.5,0.00,782.5,17.38,782.5,17.36,778.6,0.00,778.6,16.35,778.6,0.00,758.0,0.00,758.0,19.77,758.0,19.28,760.7,0.00,760.7,241.91
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 11:40:00,136.587,196.098,73.6,2026/09/02 15:36:36,Grid connected : self derating,229.8,195.356,235.2,195.229,233.7,15.07,774.1,0.00,774.1,16.27,774.1,15.87,774.7,0.00,774.7,15.17,774.7,0.00,741.9,0.00,741.9,19.88,741.9,19.72,744.7,0.00,744.7,253.45
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 11:45:00,138.073,198.074,73.0,2026/09/02 15:36:36,Grid connected,230.8,197.290,235.2,197.248,233.7,17.75,714.4,0.00,714.4,17.99,714.4,17.82,716.7,0.00,716.7,17.98,716.7,0.00,714.2,0.00,714.2,18.06,714.2,18.02,720.7,0.00,720.7,264.09
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 11:50:00,129.835,186.708,73.4,2026/09/02 15:36:36,Grid connected,230.8,186.032,235.2,185.996,233.7,16.55,736.5,0.00,736.5,16.77,736.5,16.67,734.6,0.00,734.6,16.72,734.6,0.00,737.6,0.00,737.6,16.50,737.6,16.67,729.2,0.00,729.2,274.87
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 11:55:00,132.979,190.705,73.2,2026/09/02 15:36:36,Grid connected,230.8,189.938,235.2,189.924,234.7,17.97,720.9,0.00,720.9,17.83,720.9,17.54,718.4,0.00,718.4,17.50,718.4,0.00,727.4,0.00,727.4,17.08,727.4,17.03,721.2,0.00,721.2,286.11
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 12:00:00,145.574,208.354,74.4,2026/09/02 15:36:36,Grid connected,230.8,207.622,236.1,207.478,234.7,16.02,780.6,0.00,780.6,17.48,780.6,17.03,783.2,0.00,783.2,16.18,783.2,0.00,702.8,0.00,702.8,21.75,702.8,21.81,716.9,0.00,716.9,298.06
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 12:05:00,106.595,152.844,74.3,2026/09/02 15:36:36,Grid connected,230.8,152.410,235.1,152.342,234.7,12.62,723.6,0.00,723.6,13.44,723.6,13.94,719.2,0.00,719.2,14.04,719.2,0.00,726.7,0.00,726.7,13.74,726.7,13.60,729.2,0.00,729.2,308.79
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 12:10:00,165.000,235.457,72.7,2026/09/02 15:36:36,Grid connected,231.8,234.698,237.3,234.509,235.7,20.61,748.5,0.00,748.5,20.86,748.5,20.70,747.6,0.00,747.6,20.44,747.6,0.00,723.9,0.00,723.9,21.78,723.9,21.75,721.1,0.00,721.1,318.96
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 12:15:00,134.950,192.973,73.0,2026/09/02 15:36:36,Grid connected,231.8,192.243,236.4,192.219,234.7,17.47,671.4,0.00,671.4,17.73,671.4,16.75,719.2,0.00,719.2,17.19,719.2,0.00,727.8,0.00,727.8,17.35,727.8,18.28,709.8,0.00,709.8,330.24
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 12:20:00,122.925,176.162,71.7,2026/09/02 15:36:36,Grid connected,230.8,175.593,235.4,175.561,233.7,16.28,723.1,0.00,723.1,16.34,723.1,15.99,729.0,0.00,729.0,15.95,729.0,0.00,647.8,0.00,647.8,17.57,647.8,15.64,730.1,0.00,730.1,339.51
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 12:25:00,100.389,144.234,71.6,2026/09/02 15:36:36,Grid connected,230.8,143.618,234.4,143.569,233.7,13.03,719.1,0.00,719.1,13.16,719.1,12.70,737.5,0.00,737.5,12.71,737.5,0.00,734.6,0.00,734.6,12.67,734.6,12.68,734.1,0.00,734.1,349.53
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 12:30:00,124.144,178.010,70.0,2026/09/02 15:36:36,Grid connected,230.8,177.362,235.4,177.301,233.7,16.09,731.1,0.00,731.1,16.14,731.1,15.99,729.1,0.00,729.1,15.99,729.1,0.00,733.6,0.00,733.6,15.72,733.6,15.68,734.1,0.00,734.1,358.70
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 12:35:00,163.009,232.810,71.4,2026/09/02 15:36:36,Grid connected,231.8,231.914,236.4,231.744,234.7,22.01,716.6,0.00,716.6,21.96,716.6,21.91,720.8,0.00,720.8,21.63,720.8,0.00,721.8,0.00,721.8,21.11,721.8,20.89,719.7,0.00,719.7,370.38
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 12:40:00,147.698,211.314,72.9,2026/09/02 15:36:36,Grid connected,230.8,210.710,235.4,210.547,234.7,16.41,778.2,0.00,778.2,17.45,778.2,17.11,779.3,0.00,779.3,16.46,779.3,0.00,721.7,0.00,721.7,21.82,721.7,21.86,723.5,0.00,723.5,382.31
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 12:45:00,147.789,211.884,73.8,2026/09/02 15:36:36,Grid connected,230.8,211.195,235.4,210.997,234.7,16.60,775.9,0.00,775.9,17.60,775.9,17.34,775.8,0.00,775.8,16.57,775.8,0.00,721.7,0.00,721.7,21.78,721.7,21.81,703.5,0.00,703.5,394.29
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 12:50:00,163.044,233.586,72.7,2026/09/02 15:36:36,Grid connected,231.1,232.841,236.2,232.423,234.9,21.78,703.7,0.00,703.7,21.79,703.7,21.60,717.8,0.00,717.8,21.51,717.8,0.00,728.0,0.00,728.0,20.92,728.0,19.48,747.9,0.00,747.9,403.82
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 12:55:00,68.134,98.254,75.6,2026/09/02 15:36:36,Grid connected,230.1,98.078,233.8,97.934,232.4,8.98,691.6,0.00,691.6,9.14,691.6,8.90,707.4,0.00,707.4,8.97,707.4,0.00,714.2,0.00,714.2,8.85,714.2,8.94,713.1,0.00,713.1,416.33
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 13:00:00,165.000,234.324,71.9,2026/09/02 15:36:36,Grid connected,232.7,233.558,238.0,233.362,236.3,19.74,771.1,0.00,771.1,20.13,771.1,20.09,769.7,0.00,769.7,19.46,769.7,0.00,742.3,0.00,742.3,21.81,742.3,21.84,716.7,0.00,716.7,424.25
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 13:05:00,0.000,0.000,74.4,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 13:10:00,0.000,0.000,73.2,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 13:15:00,0.000,0.000,71.0,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 13:20:00,0.000,0.000,68.9,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 13:25:00,0.000,0.000,67.0,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 13:30:00,0.000,0.000,65.3,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 13:35:00,0.000,0.000,63.8,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 13:40:00,0.000,0.000,62.4,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 13:45:00,0.000,0.000,61.1,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 13:50:00,0.000,0.000,60.0,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 13:55:00,0.000,0.000,59.1,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 14:00:00,0.000,0.000,58.2,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 14:05:00,0.000,0.000,57.3,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 14:10:00,0.000,0.000,56.5,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 14:15:00,0.000,0.000,55.7,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 14:20:00,0.000,0.000,55.0,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 14:25:00,0.000,0.000,54.4,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 14:30:00,0.000,0.000,53.8,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 14:35:00,0.000,0.000,53.1,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 14:40:00,0.000,0.000,52.6,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 14:45:00,0.000,0.000,52.0,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 14:50:00,0.000,0.000,51.5,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 14:55:00,0.000,0.000,51.1,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 15:00:00,0.000,0.000,50.7,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 15:05:00,0.000,0.000,50.3,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 15:10:00,0.000,0.000,49.9,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 15:15:00,0.000,0.000,49.6,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 15:20:00,0.000,0.000,49.2,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 15:25:00,0.000,0.000,48.9,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 15:30:00,0.000,0.000,48.6,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 15:35:00,0.000,0.000,48.3,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 15:40:00,0.000,0.000,48.0,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 15:45:00,0.000,0.000,47.8,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 15:50:00,0.000,0.000,47.5,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 15:55:00,0.000,0.000,47.3,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 16:00:00,0.000,0.000,47.1,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 16:05:00,0.000,0.000,46.8,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 16:10:00,0.000,0.000,46.6,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 16:20:00,0.000,0.000,46.2,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 16:25:00,0.000,0.000,46.0,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 16:30:00,0.000,0.000,45.9,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 16:35:00,0.000,0.000,45.7,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 16:40:00,0.000,0.000,45.5,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 16:45:00,0.000,0.000,45.4,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 16:50:00,0.000,0.000,45.2,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 16:55:00,0.000,0.000,45.1,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 17:00:00,0.000,0.000,44.9,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 17:05:00,0.000,0.000,44.8,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 17:10:00,0.000,0.000,44.7,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 17:15:00,0.000,0.000,44.5,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 17:20:00,0.000,0.000,44.4,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264G815922/INVERTER-01,2026-09-05 17:25:00,0.000,0.000,44.2,2026/09/05 13:02:49,Standby :  no sunlight,0.0,0.000,0.0,0.000,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,0.00,0.0,429.75
+
+PYEOF
+
 git add .
-git commit -m "feat: split single Gemini call into extraction -> deterministic analysis -> narrative writing (3-stage pipeline)"
+git commit -m "feat: parse inverter time-series CSV logs deterministically (no LLM call) — detects dead PV strings and extended commanded shutdowns"
 git push
