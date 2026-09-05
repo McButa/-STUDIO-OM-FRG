@@ -55,7 +55,7 @@ def test_master_report_validates_and_generates_docx():
 def test_router_makes_one_master_call(monkeypatch):
     image = io.BytesIO()
     Image.new("RGB", (20, 20), "white").save(image, format="PNG")
-    files = [Upload("ABC_2026-08-28_SMARTLOGGER_STATUS.png", image.getvalue())]
+    files = [Upload("ABC_STATUS.png", image.getvalue())]
     calls = []
 
     monkeypatch.setattr(router, "run_master_analysis", lambda *args, **kwargs: calls.append((args, kwargs)) or valid_report())
@@ -104,3 +104,4 @@ def test_historical_memory_loads_audit_and_report(tmp_path, monkeypatch):
     assert audits[0]["active_power_kw"] == "0.091"
     assert loaded["executive_summary"] == "Current evidence summary."
     assert loaded["analysis_metadata"]["docx_path"] == "reports/audit-42.docx"
+

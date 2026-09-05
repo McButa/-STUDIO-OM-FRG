@@ -11,6 +11,15 @@ If a value, diagnosis, cause, or action is not visible or proven, use null or "U
 A root cause is proven only by explicit alarm text, measurement evidence, EL evidence, or insulation test evidence.
 Keep observed_data separate from engineering_diagnosis. Cross-correlate independent evidence sources.
 
+ONE ROW PER UPLOADED FILE — MANDATORY:
+Create exactly one evidence_findings entry per uploaded file. NEVER merge several separately-uploaded files
+(e.g. Inv_2.jpg, Inv_3.jpg, Inv_4.jpg as distinct uploads) into a single row, even when they show the same
+equipment type or a similar reading — a healthy unit's data must never be absorbed into a degraded neighbor's
+row, or vice versa. If ONE uploaded file itself documents multiple pieces of equipment (e.g. a single photo of
+a paper test log covering "DC_Inv_1-2.jpg" or "AC_Inv_1-6.jpg"), that is still only one uploaded file, so it
+still gets exactly one row — describe everything visible in that one file's observed_data.
+Every uploaded file must be referenced by exactly one finding's source_file. Do not skip any file.
+
 STRUCTURED MEASUREMENTS (in addition to, never instead of, the observed_data narrative):
 For every finding, also record every numeric reading you can see as a separate entry in "key_measurements".
 Use these exact parameter names whenever the reading matches one of them (use others only when none of these fit):

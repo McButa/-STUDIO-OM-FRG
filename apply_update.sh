@@ -364,7 +364,7 @@ import uuid
 from datetime import datetime, timezone
 
 from core.docx_generator import build_docx
-from core.evidence_validator import coerce_float, validate_report
+from core.evidence_validator import coerce_float, validate_evidence_coverage, validate_report
 from core.job_manifest import build_manifest, manifest_summary
 from core.reference_reader import extract_reference_context
 from core.threshold_rules import apply_measurement_thresholds, apply_peer_comparison, derive_plant_totals, detect_cross_source_conflicts, reconcile_narrative_with_findings
@@ -372,8 +372,34 @@ from database.db_manager import get_plant_history_context, get_previous_audit_kp
 from engines.master_engine import run_master_analysis
 from engines.verification_engine import run_critical_verification
 
-PROMPT_VERSION = "2026-09-03-master-v4-threshold-rules"
+PROMPT_VERSION = "2026-09-04-master-v5-coverage-retry"
 REPORT_SCHEMA_VERSION = "2.1"
+MAX_COVERAGE_RETRIES = 2
+
+
+def run_master_analysis_with_coverage_check(generate_fn, expected_filenames: list):
+    """generate_fn: no-arg callable returning a fresh report dict (a closure
+    over the real run_master_analysis call in production). Kept injectable
+    so this retry logic is unit-testable without hitting the real API.
+
+    Retries up to MAX_COVERAGE_RETRIES times if the LLM merges several
+    separately-uploaded files into one evidence_finding row, or silently
+    drops one — both are ways real information gets lost (e.g. a healthy
+    inverter's reading getting absorbed into a degraded neighbor's row).
+    Raises rather than silently shipping a report that failed every retry —
+    matches evidence_validator.validate_report's 'reject instead of
+    inventing fallback' rule."""
+    problems = []
+    report = None
+    for _ in range(MAX_COVERAGE_RETRIES):
+        report = generate_fn()
+        problems = validate_evidence_coverage(report.get("evidence_findings", []), expected_filenames)
+        if not problems:
+            return report
+    raise ValueError(
+        f"AI ไม่สามารถวิเคราะห์ครบทุกไฟล์แยกรายการได้แม้ลองใหม่ {MAX_COVERAGE_RETRIES} ครั้ง: "
+        + "; ".join(problems)
+    )
 
 
 def _file_sha256(file) -> str:
@@ -506,7 +532,11 @@ def process_field_report(uploaded_files, api_key: str, plant_name: str = "", lan
     site_context = get_plant_history_context(context_plant, report_type)
     reference_context, references = extract_reference_context(uploaded_files)
     knowledge_context = get_similar_cases_context([context_plant], report_type, context_plant)
-    report = run_master_analysis(uploaded_files, api_key, site_context, knowledge_context + reference_context, lang=lang, plant_name=context_plant or None)
+    expected_filenames = [item["filename"] for item in manifest]
+    report = run_master_analysis_with_coverage_check(
+        lambda: run_master_analysis(uploaded_files, api_key, site_context, knowledge_context + reference_context, lang=lang, plant_name=context_plant or None),
+        expected_filenames,
+    )
     report = derive_plant_totals(report)
     report, status_hard_locked = _enforce_engineering_rules(report)
     report, measurement_locked = apply_measurement_thresholds(report)
@@ -1203,6 +1233,44 @@ class MasterReport(BaseModel):
     spare_parts_tools: list[SparePartTool]
 
 
+def validate_evidence_coverage(evidence_findings: list, expected_filenames: list) -> list:
+    """Two things must both hold, or the LLM's response is not trustworthy
+    enough to accept:
+      1. Every uploaded file is referenced by at least one finding — nothing
+         silently dropped.
+      2. No single finding's source_file matches MORE THAN ONE of the
+         separately-uploaded filenames — that is the real bug found in
+         production: 5 individually-uploaded inverter screenshots
+         (Inv_2.jpg .. Inv_6.jpg) got merged into a single row, silently
+         losing the fact that Inv_6 (13.541 MOhm, healthy) is a completely
+         different unit from Inv_2-5 (0.836-0.921 MOhm, degraded).
+      This does NOT reject a genuine single batch-test file whose CONTENT
+      covers several inverters (e.g. 'DC_Inv_1-2.jpg', 'AC_Inv_1-6.jpg') —
+      that file was itself uploaded as ONE file, so it only ever matches
+      ONE entry in expected_filenames, never more than one.
+    Returns a list of human-readable problem strings; empty list = OK.
+    """
+    problems = []
+    referenced = set()
+    for finding in evidence_findings:
+        if not isinstance(finding, dict):
+            continue
+        source_file = str(finding.get("source_file", ""))
+        matches = [fn for fn in expected_filenames if fn and fn in source_file]
+        if len(matches) > 1:
+            problems.append(
+                f"finding source_file '{source_file}' merges {len(matches)} separately-uploaded "
+                f"files into one row ({matches}) — each uploaded file needs its own row"
+            )
+        referenced.update(matches)
+
+    missing = [fn for fn in expected_filenames if fn not in referenced]
+    if missing:
+        problems.append(f"no evidence_finding references uploaded file(s): {missing}")
+
+    return problems
+
+
 def validate_report(data: dict) -> dict:
     """Validate the master report and reject unsupported claims instead of inventing fallback text."""
     try:
@@ -1321,6 +1389,15 @@ DO NOT invent numbers or default to template examples. Extract only visible numb
 If a value, diagnosis, cause, or action is not visible or proven, use null or "UNCONFIRMED".
 A root cause is proven only by explicit alarm text, measurement evidence, EL evidence, or insulation test evidence.
 Keep observed_data separate from engineering_diagnosis. Cross-correlate independent evidence sources.
+
+ONE ROW PER UPLOADED FILE — MANDATORY:
+Create exactly one evidence_findings entry per uploaded file. NEVER merge several separately-uploaded files
+(e.g. Inv_2.jpg, Inv_3.jpg, Inv_4.jpg as distinct uploads) into a single row, even when they show the same
+equipment type or a similar reading — a healthy unit's data must never be absorbed into a degraded neighbor's
+row, or vice versa. If ONE uploaded file itself documents multiple pieces of equipment (e.g. a single photo of
+a paper test log covering "DC_Inv_1-2.jpg" or "AC_Inv_1-6.jpg"), that is still only one uploaded file, so it
+still gets exactly one row — describe everything visible in that one file's observed_data.
+Every uploaded file must be referenced by exactly one finding's source_file. Do not skip any file.
 
 STRUCTURED MEASUREMENTS (in addition to, never instead of, the observed_data narrative):
 For every finding, also record every numeric reading you can see as a separate entry in "key_measurements".
@@ -2100,6 +2177,116 @@ def test_relative_threshold_is_tunable():
 
 PYEOF
 
+cat > tests/test_master_pipeline.py << 'PYEOF'
+import io
+import sys
+from pathlib import Path
+
+from PIL import Image
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import router
+from core.evidence_validator import validate_report
+from core.docx_generator import build_docx
+from engines.master_engine import _parse_json_response
+import database.db_manager as db_manager
+
+
+class Upload:
+    def __init__(self, name, content=None):
+        self.name = name
+        self._bytes = io.BytesIO(content or b"")
+
+    def read(self):
+        return self._bytes.read()
+
+    def seek(self, position):
+        self._bytes.seek(position)
+
+
+def valid_report():
+    return {
+        "plant_summary": {
+            "plant_name": "ABC", "rated_capacity_kw": "500", "audit_date": "2026-08-28",
+            "overall_status": "WARNING", "active_power_kw": "0.091", "grid_current_a": "10.18",
+        },
+        "executive_summary": "Current evidence summary.",
+        "evidence_findings": [{
+            "category": "Inverter & Monitoring", "source_file": "ABC_STATUS.png",
+            "observed_data": "Active power 0.091 kW", "engineering_diagnosis": "Review shutdown state",
+            "severity": "WARNING",
+        }],
+        "root_causes": [],
+        "corrective_actions": [{"step_number": 1, "title": "Verify", "actions": ["Inspect current evidence"]}],
+        "spare_parts_tools": [],
+    }
+
+
+def test_master_report_validates_and_generates_docx():
+    report = validate_report(valid_report())
+    document = build_docx(report)
+    assert report["plant_summary"]["active_power_kw"] == "0.091"
+    assert len(document.getvalue()) > 1000
+
+
+def test_router_makes_one_master_call(monkeypatch):
+    image = io.BytesIO()
+    Image.new("RGB", (20, 20), "white").save(image, format="PNG")
+    files = [Upload("ABC_STATUS.png", image.getvalue())]
+    calls = []
+
+    monkeypatch.setattr(router, "run_master_analysis", lambda *args, **kwargs: calls.append((args, kwargs)) or valid_report())
+    monkeypatch.setattr(router, "get_plant_history_context", lambda *args: "")
+    monkeypatch.setattr(router, "get_similar_cases_context", lambda *args: "")
+    monkeypatch.setattr(router, "extract_reference_context", lambda files: ("", []))
+
+    report, document, report_type, _ = router.process_field_report(files, "key")
+
+    assert len(calls) == 1
+    assert report_type == "MASTER_REPORT"
+    assert report["evidence_manifest"][0]["evidence_type"] == "STATUS"
+    assert len(document.getvalue()) > 1000
+
+
+def test_unproven_root_cause_is_marked_unconfirmed():
+    report = valid_report()
+    report["root_causes"] = [{
+        "issue": "Microcrack", "description": "Confirmed module damage", "supporting_evidence": "Image",
+    }]
+    result = validate_report(report)
+    assert result["root_causes"][0]["description"] == "UNCONFIRMED_HYPOTHESIS"
+
+
+def test_master_json_parser_strips_markdown_fence():
+    assert _parse_json_response('```json\n{"ok": true}\n```') == {"ok": True}
+
+
+def test_cache_key_changes_with_language_and_plant():
+    file = Upload("ABC_STATUS.png")
+    assert router.build_job_cache_key([file], "key", "ABC", "th") != router.build_job_cache_key([file], "key", "ABC", "en")
+    assert router.build_job_cache_key([file], "key", "ABC", "th") != router.build_job_cache_key([file], "key", "XYZ", "th")
+
+
+def test_historical_memory_loads_audit_and_report(tmp_path, monkeypatch):
+    monkeypatch.setattr(db_manager, "DB_PATH", str(tmp_path / "memory.db"))
+    db_manager.init_database()
+    report = valid_report()
+    report["analysis_metadata"] = {"audit_id": "audit-42", "docx_path": "reports/audit-42.docx"}
+    db_manager.save_approved_report_to_db(report)
+
+    audits = db_manager.get_all_audits()
+    loaded = db_manager.get_audit_by_id("audit-42")
+
+    assert audits[0]["audit_id"] == "audit-42"
+    assert audits[0]["active_power_kw"] == "0.091"
+    assert loaded["executive_summary"] == "Current evidence summary."
+    assert loaded["analysis_metadata"]["docx_path"] == "reports/audit-42.docx"
+
+PYEOF
+
 git add .
-git commit -m "fix: peer/total calculations no longer polluted by multi-inverter batch test files; reconcile narrative text with escalated findings"
+git commit -m "feat: enforce one-row-per-file in prompt; fix legacy test broken by coverage check"
 git push

@@ -147,6 +147,44 @@ class MasterReport(BaseModel):
     spare_parts_tools: list[SparePartTool]
 
 
+def validate_evidence_coverage(evidence_findings: list, expected_filenames: list) -> list:
+    """Two things must both hold, or the LLM's response is not trustworthy
+    enough to accept:
+      1. Every uploaded file is referenced by at least one finding — nothing
+         silently dropped.
+      2. No single finding's source_file matches MORE THAN ONE of the
+         separately-uploaded filenames — that is the real bug found in
+         production: 5 individually-uploaded inverter screenshots
+         (Inv_2.jpg .. Inv_6.jpg) got merged into a single row, silently
+         losing the fact that Inv_6 (13.541 MOhm, healthy) is a completely
+         different unit from Inv_2-5 (0.836-0.921 MOhm, degraded).
+      This does NOT reject a genuine single batch-test file whose CONTENT
+      covers several inverters (e.g. 'DC_Inv_1-2.jpg', 'AC_Inv_1-6.jpg') —
+      that file was itself uploaded as ONE file, so it only ever matches
+      ONE entry in expected_filenames, never more than one.
+    Returns a list of human-readable problem strings; empty list = OK.
+    """
+    problems = []
+    referenced = set()
+    for finding in evidence_findings:
+        if not isinstance(finding, dict):
+            continue
+        source_file = str(finding.get("source_file", ""))
+        matches = [fn for fn in expected_filenames if fn and fn in source_file]
+        if len(matches) > 1:
+            problems.append(
+                f"finding source_file '{source_file}' merges {len(matches)} separately-uploaded "
+                f"files into one row ({matches}) — each uploaded file needs its own row"
+            )
+        referenced.update(matches)
+
+    missing = [fn for fn in expected_filenames if fn not in referenced]
+    if missing:
+        problems.append(f"no evidence_finding references uploaded file(s): {missing}")
+
+    return problems
+
+
 def validate_report(data: dict) -> dict:
     """Validate the master report and reject unsupported claims instead of inventing fallback text."""
     try:

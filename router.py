@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime, timezone
 
 from core.docx_generator import build_docx
-from core.evidence_validator import coerce_float, validate_report
+from core.evidence_validator import coerce_float, validate_evidence_coverage, validate_report
 from core.job_manifest import build_manifest, manifest_summary
 from core.reference_reader import extract_reference_context
 from core.threshold_rules import apply_measurement_thresholds, apply_peer_comparison, derive_plant_totals, detect_cross_source_conflicts, reconcile_narrative_with_findings
@@ -11,8 +11,34 @@ from database.db_manager import get_plant_history_context, get_previous_audit_kp
 from engines.master_engine import run_master_analysis
 from engines.verification_engine import run_critical_verification
 
-PROMPT_VERSION = "2026-09-03-master-v4-threshold-rules"
+PROMPT_VERSION = "2026-09-04-master-v5-coverage-retry"
 REPORT_SCHEMA_VERSION = "2.1"
+MAX_COVERAGE_RETRIES = 2
+
+
+def run_master_analysis_with_coverage_check(generate_fn, expected_filenames: list):
+    """generate_fn: no-arg callable returning a fresh report dict (a closure
+    over the real run_master_analysis call in production). Kept injectable
+    so this retry logic is unit-testable without hitting the real API.
+
+    Retries up to MAX_COVERAGE_RETRIES times if the LLM merges several
+    separately-uploaded files into one evidence_finding row, or silently
+    drops one — both are ways real information gets lost (e.g. a healthy
+    inverter's reading getting absorbed into a degraded neighbor's row).
+    Raises rather than silently shipping a report that failed every retry —
+    matches evidence_validator.validate_report's 'reject instead of
+    inventing fallback' rule."""
+    problems = []
+    report = None
+    for _ in range(MAX_COVERAGE_RETRIES):
+        report = generate_fn()
+        problems = validate_evidence_coverage(report.get("evidence_findings", []), expected_filenames)
+        if not problems:
+            return report
+    raise ValueError(
+        f"AI ไม่สามารถวิเคราะห์ครบทุกไฟล์แยกรายการได้แม้ลองใหม่ {MAX_COVERAGE_RETRIES} ครั้ง: "
+        + "; ".join(problems)
+    )
 
 
 def _file_sha256(file) -> str:
@@ -145,7 +171,11 @@ def process_field_report(uploaded_files, api_key: str, plant_name: str = "", lan
     site_context = get_plant_history_context(context_plant, report_type)
     reference_context, references = extract_reference_context(uploaded_files)
     knowledge_context = get_similar_cases_context([context_plant], report_type, context_plant)
-    report = run_master_analysis(uploaded_files, api_key, site_context, knowledge_context + reference_context, lang=lang, plant_name=context_plant or None)
+    expected_filenames = [item["filename"] for item in manifest]
+    report = run_master_analysis_with_coverage_check(
+        lambda: run_master_analysis(uploaded_files, api_key, site_context, knowledge_context + reference_context, lang=lang, plant_name=context_plant or None),
+        expected_filenames,
+    )
     report = derive_plant_totals(report)
     report, status_hard_locked = _enforce_engineering_rules(report)
     report, measurement_locked = apply_measurement_thresholds(report)
