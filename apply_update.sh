@@ -170,9 +170,9 @@ with tab_report:
             st.rerun()
 
     uploaded_files = st.file_uploader(
-        "ลากไฟล์หลักฐานหน้างาน, notes.txt และเอกสารอ้างอิง PDF มาวางที่นี่",
+        "ลากไฟล์หลักฐานหน้างาน, notes.txt, ไฟล์ CSV ข้อมูลอินเวอร์เตอร์ และเอกสารอ้างอิง PDF มาวางที่นี่",
         accept_multiple_files=True,
-        type=["jpg", "jpeg", "png", "webp", "txt", "pdf"],
+        type=["jpg", "jpeg", "png", "webp", "txt", "pdf", "csv"],
         key=f"report_uploader_{st.session_state['report_uploader_key']}"
     )
 
@@ -3185,5 +3185,5 @@ MEIYUME MANUFACTURING,/J.T.N.ENERGY COMPANY LIMITED/SOLARVEST ASSET,Logger-10264
 PYEOF
 
 git add .
-git commit -m "feat: parse inverter time-series CSV logs deterministically (no LLM call) — detects dead PV strings and extended commanded shutdowns"
+git commit -m "fix: allow .csv uploads in the file uploader widget (backend parser existed but UI blocked the file type)"
 git push
