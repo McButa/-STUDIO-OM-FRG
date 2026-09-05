@@ -5,7 +5,16 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from core.threshold_rules import apply_measurement_thresholds, apply_peer_comparison, derive_plant_totals, detect_cross_source_conflicts, reconcile_narrative_with_findings
+from core.threshold_rules import (
+    apply_measurement_thresholds,
+    apply_peer_comparison,
+    derive_plant_totals,
+    detect_cross_source_conflicts,
+    fill_default_diagnosis,
+    finalize_overall_status,
+    initialize_finding_defaults,
+    reconcile_narrative_with_findings,
+)
 from router import _enforce_engineering_rules
 
 
@@ -445,6 +454,72 @@ def test_root_causes_schema_stays_valid_after_reconciliation():
     for ca in result["corrective_actions"]:
         assert set(ca.keys()) >= {"step_number", "title", "actions"}
         assert isinstance(ca["step_number"], int) and ca["step_number"] >= 1
+
+
+# --- Pipeline-stage helpers (extraction/analysis/narrative split) -------
+
+def test_initialize_finding_defaults_fills_missing_fields():
+    report = {"evidence_findings": [{"category": "Inverter & Monitoring", "source_file": "Inv_1.jpg", "observed_data": "20 MOhm"}]}
+    result = initialize_finding_defaults(report)
+    f = result["evidence_findings"][0]
+    assert f["severity"] == "NORMAL"
+    assert f["engineering_diagnosis"] == ""
+    assert f["key_measurements"] == []
+
+
+def test_initialize_finding_defaults_never_overwrites_existing_values():
+    report = {"evidence_findings": [{"severity": "CRITICAL", "engineering_diagnosis": "already set"}]}
+    result = initialize_finding_defaults(report)
+    assert result["evidence_findings"][0]["severity"] == "CRITICAL"
+    assert result["evidence_findings"][0]["engineering_diagnosis"] == "already set"
+
+
+def test_fill_default_diagnosis_only_touches_empty_ones():
+    report = _report([
+        _finding("Inverter & Monitoring", "Inv_1.jpg", "20 MOhm", diagnosis=""),
+        _finding("Inverter & Monitoring", "Inv_2.jpg", "0.8 MOhm", diagnosis="already explained"),
+    ])
+    result = fill_default_diagnosis(report)
+    assert "ไม่มีกฎตรวจสอบอัตโนมัติ" in result["evidence_findings"][0]["engineering_diagnosis"]
+    assert result["evidence_findings"][1]["engineering_diagnosis"] == "already explained"
+
+
+def test_finalize_overall_status_computed_purely_from_findings():
+    report = _report([
+        _finding("Inverter & Monitoring", "Inv_1.jpg", "", severity="NORMAL"),
+        _finding("Inverter & Monitoring", "Inv_2.jpg", "", severity="WARNING"),
+    ], overall_status="NORMAL")
+    result = finalize_overall_status(report)
+    assert result["plant_summary"]["overall_status"] == "WARNING"
+
+
+def test_finalize_overall_status_cannot_exceed_worst_finding_without_a_hard_lock():
+    """The bug this closes: a report header said CRITICAL while every single
+    finding topped out at WARNING — because overall_status used to be a
+    free-floating field the LLM could set independently of its own
+    per-finding severities. Now there's no such field for the LLM to set at
+    all (run_extraction produces no overall_status), so an ungrounded
+    CRITICAL claim like that is structurally impossible: this function is
+    the ONLY thing that ever sets plant_summary.overall_status from
+    scratch, and it can only derive CRITICAL from an actual CRITICAL
+    finding or a prior hard lock."""
+    report = _report([
+        _finding("Inverter & Monitoring", "Inv_2.jpg", "", severity="WARNING"),
+        _finding("Inverter & Monitoring", "Inv_3.jpg", "", severity="WARNING"),
+    ])  # plant_summary starts with no overall_status key at all, like real extraction output
+    del report["plant_summary"]
+    report["plant_summary"] = {}
+    result = finalize_overall_status(report)
+    assert result["plant_summary"]["overall_status"] == "WARNING"  # never CRITICAL — nothing justifies it
+
+
+def test_finalize_overall_status_preserves_a_genuine_hard_lock():
+    # _enforce_engineering_rules sets this directly on plant_summary BEFORE
+    # finalize_overall_status runs, for plant-level facts (e.g. confirmed
+    # zero grid current) that aren't any single photo's severity.
+    report = _report([_finding("Inverter & Monitoring", "Inv_1.jpg", "", severity="NORMAL")], overall_status="CRITICAL")
+    result = finalize_overall_status(report)
+    assert result["plant_summary"]["overall_status"] == "CRITICAL"
 
 
 # --- Coverage for router's existing hard-coded rules (previously untested) --

@@ -3,13 +3,27 @@ from datetime import date
 
 from core.vision_client import execute_gemini_vision, optimize_image
 
-MASTER_ENGINE_PROMPT = """
-You are the STUDIO OM Solar O&M Engineering Synthesis Engine.
-Analyze only the current uploaded evidence and field notes. Historical/reference material is context, never current evidence.
+# --- Stage 1: Extraction --------------------------------------------------
+# This model's ONLY job is to describe what's visible in the evidence. It
+# does not decide severity, and it must not use judgment words ("ปกติ",
+# "ผิดปกติ", "urgent") — that judgment is computed afterward by deterministic
+# engineering rules (core/threshold_rules.py), not guessed by the model in
+# the same breath as it's still perceiving the evidence. This is the fix for
+# the root cause behind nearly every bug found in this system so far: one
+# single LLM call used to do perception AND judgment AND narrative writing
+# together, so the same 0.836 MOhm reading could come out NORMAL one run and
+# WARNING the next, entirely depending on how the model felt like phrasing
+# things that pass — not on the number itself.
+EXTRACTION_PROMPT = """
+You are the STUDIO OM Solar O&M Evidence Extraction Engine.
+Your ONLY job is to describe what is visible in the evidence. You do NOT judge whether anything is normal,
+abnormal, safe, or unsafe, and you do NOT decide severity — severity is computed separately by deterministic
+engineering rules, not by you. Do not use judgment words like "ปกติ", "ผิดปกติ", "urgent", "normal", "abnormal"
+in observed_data — describe the reading itself, not your opinion of it.
+Analyze only the current uploaded evidence and field notes. Historical/reference material is context, never
+current evidence.
 DO NOT invent numbers or default to template examples. Extract only visible numbers, labels, and text.
-If a value, diagnosis, cause, or action is not visible or proven, use null or "UNCONFIRMED".
-A root cause is proven only by explicit alarm text, measurement evidence, EL evidence, or insulation test evidence.
-Keep observed_data separate from engineering_diagnosis. Cross-correlate independent evidence sources.
+If a value is not visible or unproven, use null or "UNCONFIRMED".
 
 ONE ROW PER UPLOADED FILE — MANDATORY:
 Create exactly one evidence_findings entry per uploaded file. NEVER merge several separately-uploaded files
@@ -31,13 +45,8 @@ accordingly and "value" to that bound — do not silently turn ">1000" into an e
 Use "comparator": "=" for a directly read value. Never leave key_measurements empty when a number is visible
 in the evidence, even if that same number is also described in the observed_data text.
 
-CRITICAL INACTION DAMAGE ANALYSIS:
-For each major or critical issue found, analyze the consequential equipment damage that WILL OCCUR if neglected (e.g. Ground fault -> Inverter MPPT power board fire/short-circuit costing 80,000-150,000 THB vs 500-1,500 THB MC4 repair; Hotspot -> Cell delamination/shattered glass costing 4,500-9,000 THB module replacement vs 0-500 THB cleaning).
-Output damage and prevention costs as RAW NUMBERS ONLY (no commas, no currency symbols, no text) in min_damage_cost_thb, max_damage_cost_thb, min_prevention_cost_thb, max_prevention_cost_thb.
-
-If current evidence shows normal operation, 0 alarms, no hotspots, and normal measured currents, set overall_status strictly to NORMAL.
-For a normal operation result, set corrective_actions, spare_parts_tools, and inaction_damage_matrix to one entry stating: "ระบบทำงานสมบูรณ์ตามเกณฑ์มาตรฐาน ไม่พบความผิดปกติที่ต้องซ่อมแซมเร่งด่วน".
-If any LCD, meter screen, or thermal scale is blurry, dark, or cropped, state: "ภาพไม่ชัดเจน/ไม่สามารถอ่านค่าเชิงตัวเลขได้ แนะนำให้บันทึกภาพซ้ำหน้างาน".
+If any LCD, meter screen, or thermal scale is blurry, dark, or cropped, state in observed_data:
+"ภาพไม่ชัดเจน/ไม่สามารถอ่านค่าเชิงตัวเลขได้ แนะนำให้บันทึกภาพซ้ำหน้างาน".
 FIELD_NOTES.txt is optional; analyze visual and meter evidence when notes are absent.
 
 Return JSON only using exactly this schema:
@@ -46,23 +55,50 @@ Return JSON only using exactly this schema:
     "plant_name": "string",
     "rated_capacity_kw": "string",
     "audit_date": "string",
-    "overall_status": "CRITICAL|WARNING|NORMAL",
     "active_power_kw": "string",
     "grid_current_a": "string"
   },
-  "executive_summary": "string",
   "evidence_findings": [
     {
       "category": "Inverter & Monitoring|Field Alarms|String Electrical|Thermography|Visual Survey",
       "source_file": "string",
       "observed_data": "string",
-      "engineering_diagnosis": "string",
-      "severity": "CRITICAL|WARNING|NORMAL|INFORMATIONAL",
       "key_measurements": [
         {"parameter": "string (see fixed vocabulary above)", "value": 0, "unit": "string", "comparator": "=|>|<"}
       ]
     }
-  ],
+  ]
+}
+"""
+
+# --- Stage 3: Narrative writing -------------------------------------------
+# By the time this runs, core/threshold_rules.py has already decided every
+# finding's final severity deterministically, and router.py has computed
+# plant_summary.overall_status from those findings (never the other way
+# around). This model only explains and acts on numbers it is FORBIDDEN
+# from changing — it never re-sees the images, only the finalized JSON, so
+# there's no way for it to quietly re-litigate a severity a second time.
+NARRATIVE_PROMPT = """
+You are the STUDIO OM Report Narrative Writer. You do NOT re-analyze evidence, and you must NEVER change any
+severity, value, observed_data, or key_measurements given to you below — those were already decided by
+deterministic engineering rules and are final. Your only job is to write the narrative sections that explain
+and act on the ALREADY-DECIDED findings given to you.
+
+Every finding with severity WARNING or CRITICAL must be referenced by name (source_file) in root_causes.
+If every finding is NORMAL, set corrective_actions, spare_parts_tools, and inaction_damage_matrix to one entry
+stating: "ระบบทำงานสมบูรณ์ตามเกณฑ์มาตรฐาน ไม่พบความผิดปกติที่ต้องซ่อมแซมเร่งด่วน".
+
+CRITICAL INACTION DAMAGE ANALYSIS:
+For each WARNING or CRITICAL finding, analyze the consequential equipment damage that WILL OCCUR if neglected
+(e.g. Ground fault -> Inverter MPPT power board fire/short-circuit costing 80,000-150,000 THB vs 500-1,500 THB
+MC4 repair; Hotspot -> Cell delamination/shattered glass costing 4,500-9,000 THB module replacement vs 0-500 THB
+cleaning). Output damage and prevention costs as RAW NUMBERS ONLY (no commas, no currency symbols, no text) in
+min_damage_cost_thb, max_damage_cost_thb, min_prevention_cost_thb, max_prevention_cost_thb.
+DO NOT invent numbers for anything else. If a cause is not proven by the given findings, use "UNCONFIRMED".
+
+Return JSON only using exactly this schema:
+{
+  "executive_summary": "string",
   "inaction_damage_matrix": [
     {
       "identified_fault": "string",
@@ -75,25 +111,13 @@ Return JSON only using exactly this schema:
     }
   ],
   "root_causes": [
-    {
-      "issue": "string",
-      "description": "string",
-      "supporting_evidence": "string"
-    }
+    {"issue": "string", "description": "string", "supporting_evidence": "string"}
   ],
   "corrective_actions": [
-    {
-      "step_number": 1,
-      "title": "string",
-      "actions": ["string"]
-    }
+    {"step_number": 1, "title": "string", "actions": ["string"]}
   ],
   "spare_parts_tools": [
-    {
-      "item_name": "string",
-      "recommended_qty": "string",
-      "purpose": "string"
-    }
+    {"item_name": "string", "recommended_qty": "string", "purpose": "string"}
   ]
 }
 """
@@ -152,7 +176,11 @@ def _parse_json_response(value):
     return parsed
 
 
-def run_master_analysis(uploaded_files, api_key: str, site_context: str = "", knowledge_context: str = "", lang: str = "th", plant_name: str | None = None) -> dict:
+def run_extraction(uploaded_files, api_key: str, site_context: str = "", knowledge_context: str = "", lang: str = "th", plant_name: str | None = None) -> dict:
+    """Stage 1: perception only. Returns plant_summary (raw, unresolved
+    numbers welcome) + evidence_findings (observed_data + key_measurements,
+    NO severity field at all — that's added by core/threshold_rules.py in
+    the deterministic stage that runs between this and run_narrative_writing)."""
     lang = lang if lang in LANGUAGE_INSTRUCTIONS else "th"
     context = (
         "CURRENT EVIDENCE ONLY.\n"
@@ -163,7 +191,31 @@ def run_master_analysis(uploaded_files, api_key: str, site_context: str = "", kn
         f"Audit date: {date.today().isoformat()}"
     )
     result = execute_gemini_vision(
-        [{"text": f"{MASTER_ENGINE_PROMPT}\n{context}"}, *_file_parts(uploaded_files)],
+        [{"text": f"{EXTRACTION_PROMPT}\n{context}"}, *_file_parts(uploaded_files)],
         api_key,
     )
     return _parse_json_response(result)
+
+
+def run_narrative_writing(report: dict, api_key: str, lang: str = "th") -> dict:
+    """Stage 3: prose only, text-in/text-out (no images re-sent — cheaper,
+    and there's no path for the model to re-judge severity from a photo a
+    second time). `report` must already have final severities (i.e. this
+    runs AFTER core/threshold_rules.py). Returns a dict with just the
+    narrative fields — caller merges them into the final report."""
+    lang = lang if lang in LANGUAGE_INSTRUCTIONS else "th"
+    payload = {
+        "plant_summary": report.get("plant_summary", {}),
+        "evidence_findings": report.get("evidence_findings", []),
+    }
+    context = (
+        f"{LANGUAGE_INSTRUCTIONS[lang]}\n\n"
+        "[FINALIZED ENGINEERING FINDINGS — READ ONLY, DO NOT MODIFY]\n"
+        f"{json.dumps(payload, ensure_ascii=False)}"
+    )
+    result = execute_gemini_vision(
+        [{"text": f"{NARRATIVE_PROMPT}\n{context}"}],
+        api_key,
+    )
+    return _parse_json_response(result)
+

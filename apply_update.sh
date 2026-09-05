@@ -367,12 +367,21 @@ from core.docx_generator import build_docx
 from core.evidence_validator import coerce_float, validate_evidence_coverage, validate_report
 from core.job_manifest import build_manifest, manifest_summary
 from core.reference_reader import extract_reference_context
-from core.threshold_rules import apply_measurement_thresholds, apply_peer_comparison, derive_plant_totals, detect_cross_source_conflicts, reconcile_narrative_with_findings
+from core.threshold_rules import (
+    apply_measurement_thresholds,
+    apply_peer_comparison,
+    derive_plant_totals,
+    detect_cross_source_conflicts,
+    fill_default_diagnosis,
+    finalize_overall_status,
+    initialize_finding_defaults,
+    reconcile_narrative_with_findings,
+)
 from database.db_manager import get_plant_history_context, get_previous_audit_kpis, get_similar_cases_context
-from engines.master_engine import run_master_analysis
+from engines.master_engine import run_extraction, run_narrative_writing
 from engines.verification_engine import run_critical_verification
 
-PROMPT_VERSION = "2026-09-04-master-v5-coverage-retry"
+PROMPT_VERSION = "2026-09-05-master-v6-extract-analyze-narrate"
 REPORT_SCHEMA_VERSION = "2.1"
 MAX_COVERAGE_RETRIES = 2
 
@@ -534,16 +543,31 @@ def process_field_report(uploaded_files, api_key: str, plant_name: str = "", lan
     knowledge_context = get_similar_cases_context([context_plant], report_type, context_plant)
     expected_filenames = [item["filename"] for item in manifest]
     report = run_master_analysis_with_coverage_check(
-        lambda: run_master_analysis(uploaded_files, api_key, site_context, knowledge_context + reference_context, lang=lang, plant_name=context_plant or None),
+        lambda: run_extraction(uploaded_files, api_key, site_context, knowledge_context + reference_context, lang=lang, plant_name=context_plant or None),
         expected_filenames,
     )
+
+    # --- Stage 2: deterministic engineering analysis (pure code, no LLM) ---
+    # Severity is decided ENTIRELY in this block now. run_extraction() above
+    # produces no severity/overall_status at all, so there is no LLM guess
+    # to override here — only rules.
+    report = initialize_finding_defaults(report)
     report = derive_plant_totals(report)
     report, status_hard_locked = _enforce_engineering_rules(report)
     report, measurement_locked = apply_measurement_thresholds(report)
     report = apply_peer_comparison(report)
     report = detect_cross_source_conflicts(report)
-    report = reconcile_narrative_with_findings(report)
+    report = fill_default_diagnosis(report)
+    report = finalize_overall_status(report)
     status_hard_locked = status_hard_locked or measurement_locked
+
+    # --- Stage 3: narrative writing (LLM #2, text-only — no images resent,
+    # no path for the model to re-judge severity from a photo a second time) ---
+    narrative = run_narrative_writing(report, api_key, lang=lang)
+    for key in ("executive_summary", "inaction_damage_matrix", "root_causes", "corrective_actions", "spare_parts_tools"):
+        if key in narrative:
+            report[key] = narrative[key]
+    report = reconcile_narrative_with_findings(report)  # safety net, not the primary mechanism anymore
     report = validate_report(report)
     if report.get("plant_summary", {}).get("overall_status") == "CRITICAL" and not status_hard_locked:
         report = run_critical_verification(uploaded_files, report, api_key)
@@ -1081,6 +1105,68 @@ def reconcile_narrative_with_findings(report: dict) -> dict:
 
     return report
 
+
+# --- Pipeline-stage helpers for the extraction/analysis/narrative split ---
+# These three functions are what actually let severity be a code-only
+# decision now, instead of "the LLM guesses, and code sometimes overrides
+# it." run_extraction() (engines/master_engine.py) no longer produces a
+# severity or overall_status field at all — these fill in the code-owned
+# defaults, then everything above (apply_measurement_thresholds,
+# apply_peer_comparison, detect_cross_source_conflicts, _enforce_engineering_
+# rules) does the actual judging, then these close out what's left.
+
+_DEFAULT_DIAGNOSIS = (
+    "อ่านค่าตามที่ปรากฏในหลักฐาน ไม่มีกฎตรวจสอบอัตโนมัติที่ระบุความผิดปกติสำหรับพารามิเตอร์นี้ "
+    "(หมายเหตุ: นี่ไม่ใช่การยืนยันว่าปกติ 100% เพียงแต่ยังไม่มีเกณฑ์ตรวจสอบอัตโนมัติครอบคลุมค่านี้)"
+)
+
+
+def initialize_finding_defaults(report: dict) -> dict:
+    """Run immediately after run_extraction(). The extraction stage no
+    longer produces severity/engineering_diagnosis at all (that's the whole
+    point), so every finding needs these code-owned fields to exist before
+    any rule tries to read or upgrade them."""
+    findings = report.get("evidence_findings", [])
+    for f in findings:
+        if isinstance(f, dict):
+            f.setdefault("severity", "NORMAL")
+            f.setdefault("engineering_diagnosis", "")
+            f.setdefault("key_measurements", [])
+    return report
+
+
+def fill_default_diagnosis(report: dict) -> dict:
+    """After every rule has had its chance to act, any finding still
+    carrying an empty engineering_diagnosis never triggered a rule at all —
+    say so honestly instead of leaving a blank cell in the report, and
+    instead of letting the narrative-writing stage invent something to fill
+    the gap."""
+    for f in report.get("evidence_findings", []):
+        if isinstance(f, dict) and not str(f.get("engineering_diagnosis", "")).strip():
+            f["engineering_diagnosis"] = _DEFAULT_DIAGNOSIS
+    return report
+
+
+def finalize_overall_status(report: dict) -> dict:
+    """overall_status is now ALWAYS derived from the findings themselves,
+    never asserted independently by an LLM — this is what closes the bug
+    where a report's header said CRITICAL while not one single finding was
+    CRITICAL (there was nothing stopping an LLM from writing a plant-level
+    status disconnected from its own per-item severities). A hard-locked
+    status already set by _enforce_engineering_rules (e.g. confirmed zero
+    grid current, which is a plant-level fact rather than any one photo's
+    severity) is preserved via _higher — never downgraded, only ever
+    matched or exceeded by the worst finding."""
+    findings = report.get("evidence_findings", [])
+    worst = "NORMAL"
+    for f in findings:
+        if isinstance(f, dict):
+            worst = _higher(worst, f.get("severity", "NORMAL"))
+    summary = report.get("plant_summary", {})
+    summary["overall_status"] = _higher(summary.get("overall_status", "NORMAL"), worst)
+    report["plant_summary"] = summary
+    return report
+
 PYEOF
 
 cat > core/evidence_validator.py << 'PYEOF'
@@ -1382,13 +1468,27 @@ from datetime import date
 
 from core.vision_client import execute_gemini_vision, optimize_image
 
-MASTER_ENGINE_PROMPT = """
-You are the STUDIO OM Solar O&M Engineering Synthesis Engine.
-Analyze only the current uploaded evidence and field notes. Historical/reference material is context, never current evidence.
+# --- Stage 1: Extraction --------------------------------------------------
+# This model's ONLY job is to describe what's visible in the evidence. It
+# does not decide severity, and it must not use judgment words ("ปกติ",
+# "ผิดปกติ", "urgent") — that judgment is computed afterward by deterministic
+# engineering rules (core/threshold_rules.py), not guessed by the model in
+# the same breath as it's still perceiving the evidence. This is the fix for
+# the root cause behind nearly every bug found in this system so far: one
+# single LLM call used to do perception AND judgment AND narrative writing
+# together, so the same 0.836 MOhm reading could come out NORMAL one run and
+# WARNING the next, entirely depending on how the model felt like phrasing
+# things that pass — not on the number itself.
+EXTRACTION_PROMPT = """
+You are the STUDIO OM Solar O&M Evidence Extraction Engine.
+Your ONLY job is to describe what is visible in the evidence. You do NOT judge whether anything is normal,
+abnormal, safe, or unsafe, and you do NOT decide severity — severity is computed separately by deterministic
+engineering rules, not by you. Do not use judgment words like "ปกติ", "ผิดปกติ", "urgent", "normal", "abnormal"
+in observed_data — describe the reading itself, not your opinion of it.
+Analyze only the current uploaded evidence and field notes. Historical/reference material is context, never
+current evidence.
 DO NOT invent numbers or default to template examples. Extract only visible numbers, labels, and text.
-If a value, diagnosis, cause, or action is not visible or proven, use null or "UNCONFIRMED".
-A root cause is proven only by explicit alarm text, measurement evidence, EL evidence, or insulation test evidence.
-Keep observed_data separate from engineering_diagnosis. Cross-correlate independent evidence sources.
+If a value is not visible or unproven, use null or "UNCONFIRMED".
 
 ONE ROW PER UPLOADED FILE — MANDATORY:
 Create exactly one evidence_findings entry per uploaded file. NEVER merge several separately-uploaded files
@@ -1410,13 +1510,8 @@ accordingly and "value" to that bound — do not silently turn ">1000" into an e
 Use "comparator": "=" for a directly read value. Never leave key_measurements empty when a number is visible
 in the evidence, even if that same number is also described in the observed_data text.
 
-CRITICAL INACTION DAMAGE ANALYSIS:
-For each major or critical issue found, analyze the consequential equipment damage that WILL OCCUR if neglected (e.g. Ground fault -> Inverter MPPT power board fire/short-circuit costing 80,000-150,000 THB vs 500-1,500 THB MC4 repair; Hotspot -> Cell delamination/shattered glass costing 4,500-9,000 THB module replacement vs 0-500 THB cleaning).
-Output damage and prevention costs as RAW NUMBERS ONLY (no commas, no currency symbols, no text) in min_damage_cost_thb, max_damage_cost_thb, min_prevention_cost_thb, max_prevention_cost_thb.
-
-If current evidence shows normal operation, 0 alarms, no hotspots, and normal measured currents, set overall_status strictly to NORMAL.
-For a normal operation result, set corrective_actions, spare_parts_tools, and inaction_damage_matrix to one entry stating: "ระบบทำงานสมบูรณ์ตามเกณฑ์มาตรฐาน ไม่พบความผิดปกติที่ต้องซ่อมแซมเร่งด่วน".
-If any LCD, meter screen, or thermal scale is blurry, dark, or cropped, state: "ภาพไม่ชัดเจน/ไม่สามารถอ่านค่าเชิงตัวเลขได้ แนะนำให้บันทึกภาพซ้ำหน้างาน".
+If any LCD, meter screen, or thermal scale is blurry, dark, or cropped, state in observed_data:
+"ภาพไม่ชัดเจน/ไม่สามารถอ่านค่าเชิงตัวเลขได้ แนะนำให้บันทึกภาพซ้ำหน้างาน".
 FIELD_NOTES.txt is optional; analyze visual and meter evidence when notes are absent.
 
 Return JSON only using exactly this schema:
@@ -1425,23 +1520,50 @@ Return JSON only using exactly this schema:
     "plant_name": "string",
     "rated_capacity_kw": "string",
     "audit_date": "string",
-    "overall_status": "CRITICAL|WARNING|NORMAL",
     "active_power_kw": "string",
     "grid_current_a": "string"
   },
-  "executive_summary": "string",
   "evidence_findings": [
     {
       "category": "Inverter & Monitoring|Field Alarms|String Electrical|Thermography|Visual Survey",
       "source_file": "string",
       "observed_data": "string",
-      "engineering_diagnosis": "string",
-      "severity": "CRITICAL|WARNING|NORMAL|INFORMATIONAL",
       "key_measurements": [
         {"parameter": "string (see fixed vocabulary above)", "value": 0, "unit": "string", "comparator": "=|>|<"}
       ]
     }
-  ],
+  ]
+}
+"""
+
+# --- Stage 3: Narrative writing -------------------------------------------
+# By the time this runs, core/threshold_rules.py has already decided every
+# finding's final severity deterministically, and router.py has computed
+# plant_summary.overall_status from those findings (never the other way
+# around). This model only explains and acts on numbers it is FORBIDDEN
+# from changing — it never re-sees the images, only the finalized JSON, so
+# there's no way for it to quietly re-litigate a severity a second time.
+NARRATIVE_PROMPT = """
+You are the STUDIO OM Report Narrative Writer. You do NOT re-analyze evidence, and you must NEVER change any
+severity, value, observed_data, or key_measurements given to you below — those were already decided by
+deterministic engineering rules and are final. Your only job is to write the narrative sections that explain
+and act on the ALREADY-DECIDED findings given to you.
+
+Every finding with severity WARNING or CRITICAL must be referenced by name (source_file) in root_causes.
+If every finding is NORMAL, set corrective_actions, spare_parts_tools, and inaction_damage_matrix to one entry
+stating: "ระบบทำงานสมบูรณ์ตามเกณฑ์มาตรฐาน ไม่พบความผิดปกติที่ต้องซ่อมแซมเร่งด่วน".
+
+CRITICAL INACTION DAMAGE ANALYSIS:
+For each WARNING or CRITICAL finding, analyze the consequential equipment damage that WILL OCCUR if neglected
+(e.g. Ground fault -> Inverter MPPT power board fire/short-circuit costing 80,000-150,000 THB vs 500-1,500 THB
+MC4 repair; Hotspot -> Cell delamination/shattered glass costing 4,500-9,000 THB module replacement vs 0-500 THB
+cleaning). Output damage and prevention costs as RAW NUMBERS ONLY (no commas, no currency symbols, no text) in
+min_damage_cost_thb, max_damage_cost_thb, min_prevention_cost_thb, max_prevention_cost_thb.
+DO NOT invent numbers for anything else. If a cause is not proven by the given findings, use "UNCONFIRMED".
+
+Return JSON only using exactly this schema:
+{
+  "executive_summary": "string",
   "inaction_damage_matrix": [
     {
       "identified_fault": "string",
@@ -1454,25 +1576,13 @@ Return JSON only using exactly this schema:
     }
   ],
   "root_causes": [
-    {
-      "issue": "string",
-      "description": "string",
-      "supporting_evidence": "string"
-    }
+    {"issue": "string", "description": "string", "supporting_evidence": "string"}
   ],
   "corrective_actions": [
-    {
-      "step_number": 1,
-      "title": "string",
-      "actions": ["string"]
-    }
+    {"step_number": 1, "title": "string", "actions": ["string"]}
   ],
   "spare_parts_tools": [
-    {
-      "item_name": "string",
-      "recommended_qty": "string",
-      "purpose": "string"
-    }
+    {"item_name": "string", "recommended_qty": "string", "purpose": "string"}
   ]
 }
 """
@@ -1531,7 +1641,11 @@ def _parse_json_response(value):
     return parsed
 
 
-def run_master_analysis(uploaded_files, api_key: str, site_context: str = "", knowledge_context: str = "", lang: str = "th", plant_name: str | None = None) -> dict:
+def run_extraction(uploaded_files, api_key: str, site_context: str = "", knowledge_context: str = "", lang: str = "th", plant_name: str | None = None) -> dict:
+    """Stage 1: perception only. Returns plant_summary (raw, unresolved
+    numbers welcome) + evidence_findings (observed_data + key_measurements,
+    NO severity field at all — that's added by core/threshold_rules.py in
+    the deterministic stage that runs between this and run_narrative_writing)."""
     lang = lang if lang in LANGUAGE_INSTRUCTIONS else "th"
     context = (
         "CURRENT EVIDENCE ONLY.\n"
@@ -1542,10 +1656,34 @@ def run_master_analysis(uploaded_files, api_key: str, site_context: str = "", kn
         f"Audit date: {date.today().isoformat()}"
     )
     result = execute_gemini_vision(
-        [{"text": f"{MASTER_ENGINE_PROMPT}\n{context}"}, *_file_parts(uploaded_files)],
+        [{"text": f"{EXTRACTION_PROMPT}\n{context}"}, *_file_parts(uploaded_files)],
         api_key,
     )
     return _parse_json_response(result)
+
+
+def run_narrative_writing(report: dict, api_key: str, lang: str = "th") -> dict:
+    """Stage 3: prose only, text-in/text-out (no images re-sent — cheaper,
+    and there's no path for the model to re-judge severity from a photo a
+    second time). `report` must already have final severities (i.e. this
+    runs AFTER core/threshold_rules.py). Returns a dict with just the
+    narrative fields — caller merges them into the final report."""
+    lang = lang if lang in LANGUAGE_INSTRUCTIONS else "th"
+    payload = {
+        "plant_summary": report.get("plant_summary", {}),
+        "evidence_findings": report.get("evidence_findings", []),
+    }
+    context = (
+        f"{LANGUAGE_INSTRUCTIONS[lang]}\n\n"
+        "[FINALIZED ENGINEERING FINDINGS — READ ONLY, DO NOT MODIFY]\n"
+        f"{json.dumps(payload, ensure_ascii=False)}"
+    )
+    result = execute_gemini_vision(
+        [{"text": f"{NARRATIVE_PROMPT}\n{context}"}],
+        api_key,
+    )
+    return _parse_json_response(result)
+
 PYEOF
 
 cat > tests/test_threshold_rules.py << 'PYEOF'
@@ -1556,7 +1694,16 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from core.threshold_rules import apply_measurement_thresholds, apply_peer_comparison, derive_plant_totals, detect_cross_source_conflicts, reconcile_narrative_with_findings
+from core.threshold_rules import (
+    apply_measurement_thresholds,
+    apply_peer_comparison,
+    derive_plant_totals,
+    detect_cross_source_conflicts,
+    fill_default_diagnosis,
+    finalize_overall_status,
+    initialize_finding_defaults,
+    reconcile_narrative_with_findings,
+)
 from router import _enforce_engineering_rules
 
 
@@ -1998,6 +2145,72 @@ def test_root_causes_schema_stays_valid_after_reconciliation():
         assert isinstance(ca["step_number"], int) and ca["step_number"] >= 1
 
 
+# --- Pipeline-stage helpers (extraction/analysis/narrative split) -------
+
+def test_initialize_finding_defaults_fills_missing_fields():
+    report = {"evidence_findings": [{"category": "Inverter & Monitoring", "source_file": "Inv_1.jpg", "observed_data": "20 MOhm"}]}
+    result = initialize_finding_defaults(report)
+    f = result["evidence_findings"][0]
+    assert f["severity"] == "NORMAL"
+    assert f["engineering_diagnosis"] == ""
+    assert f["key_measurements"] == []
+
+
+def test_initialize_finding_defaults_never_overwrites_existing_values():
+    report = {"evidence_findings": [{"severity": "CRITICAL", "engineering_diagnosis": "already set"}]}
+    result = initialize_finding_defaults(report)
+    assert result["evidence_findings"][0]["severity"] == "CRITICAL"
+    assert result["evidence_findings"][0]["engineering_diagnosis"] == "already set"
+
+
+def test_fill_default_diagnosis_only_touches_empty_ones():
+    report = _report([
+        _finding("Inverter & Monitoring", "Inv_1.jpg", "20 MOhm", diagnosis=""),
+        _finding("Inverter & Monitoring", "Inv_2.jpg", "0.8 MOhm", diagnosis="already explained"),
+    ])
+    result = fill_default_diagnosis(report)
+    assert "ไม่มีกฎตรวจสอบอัตโนมัติ" in result["evidence_findings"][0]["engineering_diagnosis"]
+    assert result["evidence_findings"][1]["engineering_diagnosis"] == "already explained"
+
+
+def test_finalize_overall_status_computed_purely_from_findings():
+    report = _report([
+        _finding("Inverter & Monitoring", "Inv_1.jpg", "", severity="NORMAL"),
+        _finding("Inverter & Monitoring", "Inv_2.jpg", "", severity="WARNING"),
+    ], overall_status="NORMAL")
+    result = finalize_overall_status(report)
+    assert result["plant_summary"]["overall_status"] == "WARNING"
+
+
+def test_finalize_overall_status_cannot_exceed_worst_finding_without_a_hard_lock():
+    """The bug this closes: a report header said CRITICAL while every single
+    finding topped out at WARNING — because overall_status used to be a
+    free-floating field the LLM could set independently of its own
+    per-finding severities. Now there's no such field for the LLM to set at
+    all (run_extraction produces no overall_status), so an ungrounded
+    CRITICAL claim like that is structurally impossible: this function is
+    the ONLY thing that ever sets plant_summary.overall_status from
+    scratch, and it can only derive CRITICAL from an actual CRITICAL
+    finding or a prior hard lock."""
+    report = _report([
+        _finding("Inverter & Monitoring", "Inv_2.jpg", "", severity="WARNING"),
+        _finding("Inverter & Monitoring", "Inv_3.jpg", "", severity="WARNING"),
+    ])  # plant_summary starts with no overall_status key at all, like real extraction output
+    del report["plant_summary"]
+    report["plant_summary"] = {}
+    result = finalize_overall_status(report)
+    assert result["plant_summary"]["overall_status"] == "WARNING"  # never CRITICAL — nothing justifies it
+
+
+def test_finalize_overall_status_preserves_a_genuine_hard_lock():
+    # _enforce_engineering_rules sets this directly on plant_summary BEFORE
+    # finalize_overall_status runs, for plant-level facts (e.g. confirmed
+    # zero grid current) that aren't any single photo's severity.
+    report = _report([_finding("Inverter & Monitoring", "Inv_1.jpg", "", severity="NORMAL")], overall_status="CRITICAL")
+    result = finalize_overall_status(report)
+    assert result["plant_summary"]["overall_status"] == "CRITICAL"
+
+
 # --- Coverage for router's existing hard-coded rules (previously untested) --
 
 def test_zero_grid_current_locks_critical():
@@ -2232,22 +2445,52 @@ def test_master_report_validates_and_generates_docx():
     assert len(document.getvalue()) > 1000
 
 
-def test_router_makes_one_master_call(monkeypatch):
+def test_router_makes_one_extraction_and_one_narrative_call(monkeypatch):
+    """Replaces the old 'exactly one master call' assertion: severity is now
+    decided by deterministic code between two LLM calls (extraction, then
+    narrative writing) instead of one call doing everything — so the correct
+    invariant is exactly one call to EACH stage, not one call total."""
     image = io.BytesIO()
     Image.new("RGB", (20, 20), "white").save(image, format="PNG")
     files = [Upload("ABC_STATUS.png", image.getvalue())]
-    calls = []
+    extraction_calls = []
+    narrative_calls = []
 
-    monkeypatch.setattr(router, "run_master_analysis", lambda *args, **kwargs: calls.append((args, kwargs)) or valid_report())
+    def fake_extraction(*args, **kwargs):
+        extraction_calls.append((args, kwargs))
+        report = valid_report()
+        # Stage 1 no longer produces severity/overall_status at all.
+        del report["plant_summary"]["overall_status"]
+        for f in report["evidence_findings"]:
+            f.pop("severity", None)
+            f.pop("engineering_diagnosis", None)
+        for key in ("executive_summary", "root_causes", "corrective_actions", "spare_parts_tools"):
+            report.pop(key, None)
+        return report
+
+    def fake_narrative(report, api_key, lang="th"):
+        narrative_calls.append((report, api_key, lang))
+        return {
+            "executive_summary": "Current evidence summary.",
+            "root_causes": [],
+            "corrective_actions": [{"step_number": 1, "title": "Verify", "actions": ["Inspect current evidence"]}],
+            "spare_parts_tools": [],
+            "inaction_damage_matrix": [],
+        }
+
+    monkeypatch.setattr(router, "run_extraction", fake_extraction)
+    monkeypatch.setattr(router, "run_narrative_writing", fake_narrative)
     monkeypatch.setattr(router, "get_plant_history_context", lambda *args: "")
     monkeypatch.setattr(router, "get_similar_cases_context", lambda *args: "")
     monkeypatch.setattr(router, "extract_reference_context", lambda files: ("", []))
 
     report, document, report_type, _ = router.process_field_report(files, "key")
 
-    assert len(calls) == 1
+    assert len(extraction_calls) == 1
+    assert len(narrative_calls) == 1
     assert report_type == "MASTER_REPORT"
     assert report["evidence_manifest"][0]["evidence_type"] == "STATUS"
+    assert report["plant_summary"]["overall_status"] in ("NORMAL", "WARNING", "CRITICAL")  # computed by code, not passed through
     assert len(document.getvalue()) > 1000
 
 
@@ -2288,5 +2531,5 @@ def test_historical_memory_loads_audit_and_report(tmp_path, monkeypatch):
 PYEOF
 
 git add .
-git commit -m "feat: enforce one-row-per-file in prompt; fix legacy test broken by coverage check"
+git commit -m "feat: split single Gemini call into extraction -> deterministic analysis -> narrative writing (3-stage pipeline)"
 git push

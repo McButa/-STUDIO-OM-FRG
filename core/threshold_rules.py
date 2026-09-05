@@ -507,3 +507,65 @@ def reconcile_narrative_with_findings(report: dict) -> dict:
 
     return report
 
+
+# --- Pipeline-stage helpers for the extraction/analysis/narrative split ---
+# These three functions are what actually let severity be a code-only
+# decision now, instead of "the LLM guesses, and code sometimes overrides
+# it." run_extraction() (engines/master_engine.py) no longer produces a
+# severity or overall_status field at all — these fill in the code-owned
+# defaults, then everything above (apply_measurement_thresholds,
+# apply_peer_comparison, detect_cross_source_conflicts, _enforce_engineering_
+# rules) does the actual judging, then these close out what's left.
+
+_DEFAULT_DIAGNOSIS = (
+    "อ่านค่าตามที่ปรากฏในหลักฐาน ไม่มีกฎตรวจสอบอัตโนมัติที่ระบุความผิดปกติสำหรับพารามิเตอร์นี้ "
+    "(หมายเหตุ: นี่ไม่ใช่การยืนยันว่าปกติ 100% เพียงแต่ยังไม่มีเกณฑ์ตรวจสอบอัตโนมัติครอบคลุมค่านี้)"
+)
+
+
+def initialize_finding_defaults(report: dict) -> dict:
+    """Run immediately after run_extraction(). The extraction stage no
+    longer produces severity/engineering_diagnosis at all (that's the whole
+    point), so every finding needs these code-owned fields to exist before
+    any rule tries to read or upgrade them."""
+    findings = report.get("evidence_findings", [])
+    for f in findings:
+        if isinstance(f, dict):
+            f.setdefault("severity", "NORMAL")
+            f.setdefault("engineering_diagnosis", "")
+            f.setdefault("key_measurements", [])
+    return report
+
+
+def fill_default_diagnosis(report: dict) -> dict:
+    """After every rule has had its chance to act, any finding still
+    carrying an empty engineering_diagnosis never triggered a rule at all —
+    say so honestly instead of leaving a blank cell in the report, and
+    instead of letting the narrative-writing stage invent something to fill
+    the gap."""
+    for f in report.get("evidence_findings", []):
+        if isinstance(f, dict) and not str(f.get("engineering_diagnosis", "")).strip():
+            f["engineering_diagnosis"] = _DEFAULT_DIAGNOSIS
+    return report
+
+
+def finalize_overall_status(report: dict) -> dict:
+    """overall_status is now ALWAYS derived from the findings themselves,
+    never asserted independently by an LLM — this is what closes the bug
+    where a report's header said CRITICAL while not one single finding was
+    CRITICAL (there was nothing stopping an LLM from writing a plant-level
+    status disconnected from its own per-item severities). A hard-locked
+    status already set by _enforce_engineering_rules (e.g. confirmed zero
+    grid current, which is a plant-level fact rather than any one photo's
+    severity) is preserved via _higher — never downgraded, only ever
+    matched or exceeded by the worst finding."""
+    findings = report.get("evidence_findings", [])
+    worst = "NORMAL"
+    for f in findings:
+        if isinstance(f, dict):
+            worst = _higher(worst, f.get("severity", "NORMAL"))
+    summary = report.get("plant_summary", {})
+    summary["overall_status"] = _higher(summary.get("overall_status", "NORMAL"), worst)
+    report["plant_summary"] = summary
+    return report
+

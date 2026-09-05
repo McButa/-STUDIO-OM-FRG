@@ -52,22 +52,52 @@ def test_master_report_validates_and_generates_docx():
     assert len(document.getvalue()) > 1000
 
 
-def test_router_makes_one_master_call(monkeypatch):
+def test_router_makes_one_extraction_and_one_narrative_call(monkeypatch):
+    """Replaces the old 'exactly one master call' assertion: severity is now
+    decided by deterministic code between two LLM calls (extraction, then
+    narrative writing) instead of one call doing everything — so the correct
+    invariant is exactly one call to EACH stage, not one call total."""
     image = io.BytesIO()
     Image.new("RGB", (20, 20), "white").save(image, format="PNG")
     files = [Upload("ABC_STATUS.png", image.getvalue())]
-    calls = []
+    extraction_calls = []
+    narrative_calls = []
 
-    monkeypatch.setattr(router, "run_master_analysis", lambda *args, **kwargs: calls.append((args, kwargs)) or valid_report())
+    def fake_extraction(*args, **kwargs):
+        extraction_calls.append((args, kwargs))
+        report = valid_report()
+        # Stage 1 no longer produces severity/overall_status at all.
+        del report["plant_summary"]["overall_status"]
+        for f in report["evidence_findings"]:
+            f.pop("severity", None)
+            f.pop("engineering_diagnosis", None)
+        for key in ("executive_summary", "root_causes", "corrective_actions", "spare_parts_tools"):
+            report.pop(key, None)
+        return report
+
+    def fake_narrative(report, api_key, lang="th"):
+        narrative_calls.append((report, api_key, lang))
+        return {
+            "executive_summary": "Current evidence summary.",
+            "root_causes": [],
+            "corrective_actions": [{"step_number": 1, "title": "Verify", "actions": ["Inspect current evidence"]}],
+            "spare_parts_tools": [],
+            "inaction_damage_matrix": [],
+        }
+
+    monkeypatch.setattr(router, "run_extraction", fake_extraction)
+    monkeypatch.setattr(router, "run_narrative_writing", fake_narrative)
     monkeypatch.setattr(router, "get_plant_history_context", lambda *args: "")
     monkeypatch.setattr(router, "get_similar_cases_context", lambda *args: "")
     monkeypatch.setattr(router, "extract_reference_context", lambda files: ("", []))
 
     report, document, report_type, _ = router.process_field_report(files, "key")
 
-    assert len(calls) == 1
+    assert len(extraction_calls) == 1
+    assert len(narrative_calls) == 1
     assert report_type == "MASTER_REPORT"
     assert report["evidence_manifest"][0]["evidence_type"] == "STATUS"
+    assert report["plant_summary"]["overall_status"] in ("NORMAL", "WARNING", "CRITICAL")  # computed by code, not passed through
     assert len(document.getvalue()) > 1000
 
 

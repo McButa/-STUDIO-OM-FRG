@@ -6,12 +6,21 @@ from core.docx_generator import build_docx
 from core.evidence_validator import coerce_float, validate_evidence_coverage, validate_report
 from core.job_manifest import build_manifest, manifest_summary
 from core.reference_reader import extract_reference_context
-from core.threshold_rules import apply_measurement_thresholds, apply_peer_comparison, derive_plant_totals, detect_cross_source_conflicts, reconcile_narrative_with_findings
+from core.threshold_rules import (
+    apply_measurement_thresholds,
+    apply_peer_comparison,
+    derive_plant_totals,
+    detect_cross_source_conflicts,
+    fill_default_diagnosis,
+    finalize_overall_status,
+    initialize_finding_defaults,
+    reconcile_narrative_with_findings,
+)
 from database.db_manager import get_plant_history_context, get_previous_audit_kpis, get_similar_cases_context
-from engines.master_engine import run_master_analysis
+from engines.master_engine import run_extraction, run_narrative_writing
 from engines.verification_engine import run_critical_verification
 
-PROMPT_VERSION = "2026-09-04-master-v5-coverage-retry"
+PROMPT_VERSION = "2026-09-05-master-v6-extract-analyze-narrate"
 REPORT_SCHEMA_VERSION = "2.1"
 MAX_COVERAGE_RETRIES = 2
 
@@ -173,16 +182,31 @@ def process_field_report(uploaded_files, api_key: str, plant_name: str = "", lan
     knowledge_context = get_similar_cases_context([context_plant], report_type, context_plant)
     expected_filenames = [item["filename"] for item in manifest]
     report = run_master_analysis_with_coverage_check(
-        lambda: run_master_analysis(uploaded_files, api_key, site_context, knowledge_context + reference_context, lang=lang, plant_name=context_plant or None),
+        lambda: run_extraction(uploaded_files, api_key, site_context, knowledge_context + reference_context, lang=lang, plant_name=context_plant or None),
         expected_filenames,
     )
+
+    # --- Stage 2: deterministic engineering analysis (pure code, no LLM) ---
+    # Severity is decided ENTIRELY in this block now. run_extraction() above
+    # produces no severity/overall_status at all, so there is no LLM guess
+    # to override here — only rules.
+    report = initialize_finding_defaults(report)
     report = derive_plant_totals(report)
     report, status_hard_locked = _enforce_engineering_rules(report)
     report, measurement_locked = apply_measurement_thresholds(report)
     report = apply_peer_comparison(report)
     report = detect_cross_source_conflicts(report)
-    report = reconcile_narrative_with_findings(report)
+    report = fill_default_diagnosis(report)
+    report = finalize_overall_status(report)
     status_hard_locked = status_hard_locked or measurement_locked
+
+    # --- Stage 3: narrative writing (LLM #2, text-only — no images resent,
+    # no path for the model to re-judge severity from a photo a second time) ---
+    narrative = run_narrative_writing(report, api_key, lang=lang)
+    for key in ("executive_summary", "inaction_damage_matrix", "root_causes", "corrective_actions", "spare_parts_tools"):
+        if key in narrative:
+            report[key] = narrative[key]
+    report = reconcile_narrative_with_findings(report)  # safety net, not the primary mechanism anymore
     report = validate_report(report)
     if report.get("plant_summary", {}).get("overall_status") == "CRITICAL" and not status_hard_locked:
         report = run_critical_verification(uploaded_files, report, api_key)
